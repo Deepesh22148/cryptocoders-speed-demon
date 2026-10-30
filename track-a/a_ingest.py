@@ -35,14 +35,13 @@ def main(data_dir, out_dir):
     with open(os.path.join(data_dir, INPUT_NAME), encoding="utf-8") as f:
         for line in f:
             ts, method, endpoint, status, latency_us = line.rstrip("\n").split(" ")
-            when = datetime.strptime(ts, TIMESTAMP_FORMAT)
-            hour = when.replace(minute=0, second=0, microsecond=0)
-            key = (hour, endpoint)
-            if key not in latencies:
-                latencies[key] = []
+            key = (ts[:13], endpoint)   # "2026-10-30T18" is the hour; no date parsing needed
+            lst = latencies.get(key)
+            if lst is None:
+                lst = latencies[key] = []
                 errors[key] = 0
-            latencies[key].append(int(latency_us))
-            if 500 <= int(status) <= 599:
+            lst.append(int(latency_us))
+            if status[0] == "5":        # status is always 3 digits, so 5xx means starts with 5
                 errors[key] += 1
 
     lines = []

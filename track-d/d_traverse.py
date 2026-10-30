@@ -19,14 +19,23 @@ import os
 
 
 def read_graph(path):
-    """Adjacency list: adj[u] is a list of (v, w) for every edge line "u v w"."""
-    with open(path, encoding="ascii") as f:
-        n, m = map(int, f.readline().split())
-        adj = [[] for _ in range(n)]
-        for line in f:
-            u, v, w = line.split()
-            adj[int(u)].append((int(v), int(w)))
-    return adj
+    with open(path, "rb") as f:
+        tok = f.read().split()
+    n, m = int(tok[0]), int(tok[1])
+    vals = list(map(int, tok[2:2 + 3 * m]))
+    adj = [[] for _ in range(n)]
+    indeg = [0] * n
+    for u, v, w in zip(vals[0::3], vals[1::3], vals[2::3]):
+        adj[u].append((v, w))
+        indeg[v] += 1
+    return adj, indeg
+
+def answer(adj, indeg, s, t):
+    if s == t:
+        return 0
+    if indeg[t] == 0 or not adj[s]:
+        return -1
+    return shortest_path(adj, s, t)
 
 
 def read_queries(path):
@@ -58,9 +67,15 @@ def shortest_path(adj, s, t):
 
 
 def main(data_dir, out_dir):
-    adj = read_graph(os.path.join(data_dir, "graph.txt"))
+    adj, indeg = read_graph(os.path.join(data_dir, "graph.txt"))
     queries = read_queries(os.path.join(data_dir, "queries.txt"))
-    answers = [shortest_path(adj, s, t) for s, t in queries]
+    cache = {}
+    answers = []
+    for s, t in queries:
+        key = (s, t)
+        if key not in cache:
+            cache[key] = answer(adj, indeg, s, t)
+        answers.append(cache[key])
     with open(os.path.join(out_dir, "distances.txt"), "w", encoding="ascii", newline="\n") as f:
         f.write("".join(f"{d}\n" for d in answers))
 
