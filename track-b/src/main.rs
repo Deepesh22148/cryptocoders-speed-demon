@@ -42,8 +42,8 @@ enum Query {
 }
 
 /// Everything known from the queries before the corpus is read. A term maps to
-/// (BOOL posting id, phrase term id); terms up to 16 bytes are also keyed by their
-/// bytes packed into a u128 (`short`), which the scan builds as it lexes. Phrases
+/// (BOOL posting id, phrase term id), keyed by its packed bytes (`short`, built
+/// the same way by the scan) when up to 16 bytes long, else by its bytes. Phrases
 /// are pid sequences found during the scan through `pairs`: each phrase is keyed
 /// by its rarest adjacent pid pair in a corpus sample, mapping to (phrase id, pair
 /// offset). `bloom` is a bit filter over those pairs.
@@ -56,6 +56,19 @@ struct Plan<'a> {
     phrases: Vec<Vec<u32>>,
     pairs: Map<u64, Vec<(u32, usize)>>,
     bloom: Vec<u64>,
+}
+
+impl<'a> Plan<'a> {
+    /// The (BOOL id, phrase id) entry of a term.
+    fn slot(&mut self, w: &'a [u8]) -> &mut (u32, u32) {
+        if w.len() <= 16 { self.short.entry(key(w)).or_insert((NO, NO)) } else { self.terms.entry(w).or_insert((NO, NO)) }
+    }
+}
+
+/// A term of up to 16 bytes packed into a u128, lowercased (alphanumeric bytes
+/// OR 0x20 are their lowercase).
+fn key(w: &[u8]) -> u128 {
+    w.iter().rev().fold(0, |k, &c| k << 8 | (c | 0x20) as u128)
 }
 
 fn pair(a: u32, b: u32) -> (u64, usize) {
@@ -95,7 +108,8 @@ struct Scan<L> {
 
 fn parse<'a>(input: &'a [u8], sample: &[u8]) -> (Vec<Query>, Plan<'a>) {
     let (mut p, mut queries, mut seen) = (Plan::default(), Vec::with_capacity(input.len() / 30), Map::default());
-    p.terms.reserve(input.len() / 20);
+    p.short.reserve(input.len() / 20);
+    let (mut bools, mut pids) = (0, 0);
     for line in input.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
         if let Some(rest) = line.strip_prefix(b"BOOL ") {
             let (mut ids, mut ops) = (Vec::with_capacity(6), Vec::with_capacity(5));
@@ -104,9 +118,9 @@ fn parse<'a>(input: &'a [u8], sample: &[u8]) -> (Vec<Query>, Plan<'a>) {
                     ops.push(w[0]);
                     continue;
                 }
-                let t = p.terms.entry(w).or_insert((NO, NO));
+                let t = p.slot(w);
                 if t.0 == NO {
-                    (t.0, p.bools) = (p.bools, p.bools + 1);
+                    (t.0, bools) = (bools, bools + 1);
                 }
                 ids.push(t.0);
             }
@@ -114,9 +128,9 @@ fn parse<'a>(input: &'a [u8], sample: &[u8]) -> (Vec<Query>, Plan<'a>) {
         } else {
             let mut ph = Vec::with_capacity(8);
             for w in line[8..line.len() - 1].split(|&b| b == b' ') {
-                let t = p.terms.entry(w).or_insert((NO, NO));
+                let t = p.slot(w);
                 if t.1 == NO {
-                    (t.1, p.pids) = (p.pids, p.pids + 1);
+                    (t.1, pids) = (pids, pids + 1);
                 }
                 ph.push(t.1);
             }
@@ -128,12 +142,11 @@ fn parse<'a>(input: &'a [u8], sample: &[u8]) -> (Vec<Query>, Plan<'a>) {
             queries.push(Query::Phrase(id));
         }
     }
+    (p.bools, p.pids) = (bools, pids);
     // Phrase term frequencies in a corpus sample pick each phrase's rarest pair.
     let mut freq = vec![0u64; p.pids as usize];
-    for w in sample.split(|b| !b.is_ascii_alphanumeric()).filter(|w| (1..=32).contains(&w.len())) {
-        let mut b = [0u8; 32];
-        b.iter_mut().zip(w).for_each(|(d, s)| *d = s | 0x20);
-        match p.terms.get(&b[..w.len()]) {
+    for w in sample.split(|b| !b.is_ascii_alphanumeric()).filter(|w| (1..=16).contains(&w.len())) {
+        match p.short.get(&key(w)) {
             Some(&(_, pid)) if pid != NO => freq[pid as usize] += 1,
             _ => {}
         }
@@ -144,9 +157,6 @@ fn parse<'a>(input: &'a [u8], sample: &[u8]) -> (Vec<Query>, Plan<'a>) {
         let (k, h) = pair(ph[a], ph[a + 1]);
         p.pairs.entry(k).or_default().push((n as u32, a));
         p.bloom[h / 64] |= 1 << (h % 64);
-    }
-    for (w, &v) in p.terms.iter().filter(|(w, _)| w.len() <= 16) {
-        p.short.insert(w.iter().rev().fold(0, |k, &c| k << 8 | c as u128), v);
     }
     (queries, p)
 }
@@ -165,7 +175,7 @@ fn index_range<L: Copy + Default + TryFrom<u32> + Into<u32>>(path: &Path, start:
     f.seek(SeekFrom::Start(off)).unwrap();
     // 64 spare bytes past the data let the scanner read whole blocks.
     let (mut buf, mut have, mut skip) = (vec![0u8; (1 << 18) + 64], 0, start > 0);
-    let (mut seq, mut cand) = (Vec::new(), Vec::new());
+    let (mut seq, mut bids) = (Vec::new(), Vec::new());
     loop {
         if have + 64 == buf.len() {
             buf.resize(have * 2 + 64, 0);
@@ -182,7 +192,7 @@ fn index_range<L: Copy + Default + TryFrom<u32> + Into<u32>>(path: &Path, start:
         };
         let i = if skip { buf.iter().position(|&b| b == b'\n').unwrap() + 1 } else { 0 };
         skip = false;
-        if !index_lines(&mut sc, &mut seq, &mut cand, &buf[i..], last + 1 - i, off + i as u64, end, p) || n == 0 {
+        if !index_lines(&mut sc, &mut seq, &mut bids, &buf[i..], last + 1 - i, off + i as u64, end, p) || n == 0 {
             break;
         }
         buf.copy_within(last + 1..have, 0);
@@ -267,14 +277,14 @@ fn masks(b: &[u8]) -> (u64, u64) {
 fn index_lines<L: Copy + Default + TryFrom<u32> + Into<u32>>(
     sc: &mut Scan<L>,
     seq: &mut Vec<u32>,
-    cand: &mut Vec<u32>,
+    bids: &mut Vec<u32>,
     text: &[u8],
     len: usize,
     base: u64,
     end: u64,
     p: &Plan,
 ) -> bool {
-    let (mut doc, mut start, mut in_tok, mut id_next, mut nc) = (0, 0, false, true, 0);
+    let (mut doc, mut start, mut in_tok, mut id_next) = (0, 0, false, true);
     if base >= end {
         return false;
     }
@@ -298,8 +308,9 @@ fn index_lines<L: Copy + Default + TryFrom<u32> + Into<u32>>(
                     if sc.ends.is_empty() {
                         sc.first = doc;
                     }
-                    (id_next, nc) = (false, 0);
+                    id_next = false;
                     seq.clear();
+                    bids.clear();
                     continue;
                 }
                 // Alphanumeric bytes OR 0x20 are their lowercase; tokens over 32
@@ -313,8 +324,14 @@ fn index_lines<L: Copy + Default + TryFrom<u32> + Into<u32>>(
                     _ => None,
                 };
                 let &(bid, pid) = t.unwrap_or(&(NO, NO));
-                if bid != NO {
-                    let (k, li) = (sc.dk[bid as usize] as usize, sc.ends.len());
+                bids.push(bid);
+                seq.push(pid);
+            }
+            if nl >> q & 1 == 1 {
+                // The doc's terms, in tight loops apart from the lexer.
+                let li = sc.ends.len();
+                for &bid in bids.iter().filter(|&&b| b != NO) {
+                    let k = sc.dk[bid as usize] as usize;
                     if k != NO as usize {
                         let v = &mut sc.early[k];
                         if v.len() <= li / 64 {
@@ -326,16 +343,6 @@ fn index_lines<L: Copy + Default + TryFrom<u32> + Into<u32>>(
                         sc.log.push(L::try_from(bid).unwrap_or_default());
                     }
                 }
-                // Record positions whose pair may anchor a phrase, without branching.
-                if cand.len() <= nc {
-                    cand.resize(nc * 2 + 64, 0);
-                }
-                let h = pair(seq.last().map_or(NO, |&x| x), pid).1;
-                cand[nc] = seq.len() as u32;
-                nc += (p.bloom[h / 64] >> (h % 64) & 1) as usize;
-                seq.push(pid);
-            }
-            if nl >> q & 1 == 1 {
                 sc.ends.push(sc.log.len() as u32);
                 if sc.ends.len() == PROBE {
                     // Terms already in 1/16 of the docs go straight to bitmaps.
@@ -346,8 +353,12 @@ fn index_lines<L: Copy + Default + TryFrom<u32> + Into<u32>>(
                         sc.early.push(Vec::new());
                     }
                 }
-                for j in cand[..nc].iter().map(|&j| j as usize).filter(|&j| j > 0) {
-                    for &(ph, a) in p.pairs.get(&pair(seq[j - 1], seq[j]).0).into_iter().flatten() {
+                for j in 1..seq.len() {
+                    let (k, h) = pair(seq[j - 1], seq[j]);
+                    if p.bloom[h / 64] >> (h % 64) & 1 == 0 {
+                        continue;
+                    }
+                    for &(ph, a) in p.pairs.get(&k).into_iter().flatten() {
                         if j > a && seq[j - 1 - a..].starts_with(&p.phrases[ph as usize]) {
                             sc.found.push((ph, doc));
                         }
