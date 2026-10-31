@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-// Fx-style hasher: keys are short, SipHash is overkill.
+// Fast hasher: keys are short, SipHash is overkill.
 #[derive(Default)]
 struct Fx(u64);
 
@@ -18,8 +18,10 @@ impl Hasher for Fx {
             self.write_u64(u64::from_le_bytes(w));
         }
     }
+    // Folded multiply: every input bit reaches the low bits the table indexes by.
     fn write_u64(&mut self, w: u64) {
-        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+        let x = (self.0 ^ w) as u128 * 0x9e37_79b9_7f4a_7c15;
+        self.0 = x as u64 ^ (x >> 64) as u64;
     }
     fn write_u128(&mut self, w: u128) {
         self.write_u64(w as u64 ^ (w >> 64) as u64);
@@ -133,34 +135,31 @@ fn index_range(path: &Path, start: u64, end: u64, p: &Plan) -> Slice {
     // starts exactly at `start` is kept.
     let mut off = start.saturating_sub(1);
     f.seek(SeekFrom::Start(off)).unwrap();
-    let mut skip = start > 0;
-    let (mut buf, mut have, mut seq) = (vec![0u8; 1 << 20], 0, Vec::new());
-    'read: loop {
-        if have == buf.len() {
-            buf.resize(have * 2, 0);
+    // 64 spare bytes past the data let the scanner read whole blocks.
+    let (mut buf, mut have, mut skip) = (vec![0u8; (1 << 20) + 64], 0, start > 0);
+    let (mut seq, mut cand) = (Vec::new(), Vec::new());
+    loop {
+        if have + 64 == buf.len() {
+            buf.resize(have * 2 + 64, 0);
         }
-        let n = f.read(&mut buf[have..]).unwrap();
+        let cap = buf.len() - 64;
+        let n = f.read(&mut buf[have..cap]).unwrap();
         have += n;
-        let mut i = 0;
-        while i < have {
-            let stop = match buf[i..have].iter().position(|&b| b == b'\n') {
-                Some(p) => i + p,
-                None if n == 0 => have,
-                None => break,
-            };
-            if off + i as u64 >= end && !skip {
-                break 'read;
+        // Whole lines only; the tail waits for the next read.
+        let Some(last) = buf[..have].iter().rposition(|&b| b == b'\n') else {
+            if n == 0 {
+                break;
             }
-            if !skip {
-                index_line(&mut sl, &mut seq, &buf[i..stop], p);
-            }
-            (skip, i) = (false, stop + 1);
-        }
-        if n == 0 {
+            continue;
+        };
+        let i = if skip { buf.iter().position(|&b| b == b'\n').unwrap() + 1 } else { 0 };
+        skip = false;
+        let more = index_lines(&mut sl, &mut seq, &mut cand, &buf[i..], last + 1 - i, off + i as u64, end, p);
+        if !more || n == 0 {
             break;
         }
-        buf.copy_within(i..have, 0);
-        (off, have) = (off + i as u64, have - i);
+        buf.copy_within(last + 1..have, 0);
+        (off, have) = (off + last as u64 + 1, have - last - 1);
     }
     // Counting sort of the log into CSR.
     sl.off = vec![0; n + 1];
@@ -183,62 +182,104 @@ fn index_range(path: &Path, start: u64, end: u64, p: &Plan) -> Slice {
     sl
 }
 
-// Byte -> lowercased token byte, or 0 for a separator.
-const LUT: [u8; 256] = {
-    let (mut t, mut b) = ([0u8; 256], 0);
-    while b < 256 {
-        let c = (b as u8).to_ascii_lowercase();
-        t[b] = if c.is_ascii_alphanumeric() { c } else { 0 };
-        b += 1;
+/// Bit masks of the alphanumeric bytes and the newlines in `b[..64]`.
+#[cfg(target_arch = "x86_64")]
+fn masks(b: &[u8]) -> (u64, u64) {
+    use std::arch::x86_64::*;
+    let (mut m, mut nl) = (0u64, 0u64);
+    for k in 0..4 {
+        // SAFETY: SSE2 is baseline on x86_64; the slice holds these 16 bytes.
+        unsafe {
+            let v = _mm_loadu_si128(b[16 * k..16 * k + 16].as_ptr() as *const __m128i);
+            // Signed compares: bytes >= 0x80 are negative, so never alphanumeric.
+            let c = _mm_or_si128(v, _mm_set1_epi8(0x20));
+            let az = _mm_and_si128(_mm_cmpgt_epi8(c, _mm_set1_epi8(0x60)), _mm_cmplt_epi8(c, _mm_set1_epi8(0x7b)));
+            let dg = _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8(0x2f)), _mm_cmplt_epi8(v, _mm_set1_epi8(0x3a)));
+            m |= (_mm_movemask_epi8(_mm_or_si128(az, dg)) as u16 as u64) << (16 * k);
+            nl |= (_mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_set1_epi8(10))) as u16 as u64) << (16 * k);
+        }
     }
-    t
-};
-
-fn push(v: &mut Vec<u32>, doc: u32) {
-    if v.last() != Some(&doc) {
-        v.push(doc);
-    }
+    (m, nl)
 }
 
-fn index_line(sl: &mut Slice, seq: &mut Vec<u32>, line: &[u8], p: &Plan) {
-    let Some(tab) = line.iter().position(|&b| b == b'\t') else { return };
-    let doc = line[..tab].iter().fold(0u32, |a, &b| a * 10 + (b - b'0') as u32);
-    let (mut buf, mut len) = ([0u8; 33], 0);
-    seq.clear();
-    for &b in line[tab + 1..].iter().chain([&b' ']) {
-        let c = LUT[b as usize];
-        if c != 0 {
-            buf[len.min(32)] = c;
-            len += 1;
-        } else if len > 0 {
-            let key = u128::from_le_bytes(buf[..16].try_into().unwrap()) & (!0u128 >> (128 - 8 * len.min(16)));
-            // Tokens over 32 bytes never equal a query term.
-            let t = match len {
-                ..=16 => p.short.get(&key),
-                ..=32 => p.terms.get(&buf[..len]),
-                _ => None,
-            };
-            let &(bid, pid) = t.unwrap_or(&(NO, NO));
-            if bid != NO && sl.last[bid as usize] != doc {
-                sl.last[bid as usize] = doc;
-                sl.log.push(bid);
+#[cfg(not(target_arch = "x86_64"))]
+fn masks(b: &[u8]) -> (u64, u64) {
+    b[..64].iter().enumerate().fold((0, 0), |(m, nl), (k, &c)| {
+        (m | (((c | 0x20).is_ascii_lowercase() || c.is_ascii_digit()) as u64) << k, nl | ((c == 10) as u64) << k)
+    })
+}
+
+/// Index the whole lines in `text[..len]` (ending with a newline; 64 readable
+/// bytes follow) whose file offset (`base` + index) is before `end`. A line's
+/// first token is its doc id. Returns false once a line starts at `end`.
+fn index_lines(sl: &mut Slice, seq: &mut Vec<u32>, cand: &mut Vec<usize>, text: &[u8], len: usize, base: u64, end: u64, p: &Plan) -> bool {
+    let (mut doc, mut start, mut in_tok, mut id_next) = (0, 0, false, true);
+    if base >= end {
+        return false;
+    }
+    for at in (0..len).step_by(64) {
+        let valid = if len - at >= 64 { !0 } else { (1u64 << (len - at)) - 1 };
+        let (m, nl) = masks(&text[at..at + 64]);
+        let (m, nl) = (m & valid, nl & valid);
+        // Bits where a token starts or ends.
+        let flips = m ^ (m << 1 | in_tok as u64);
+        let mut ev = flips | nl;
+        while ev != 0 {
+            let q = ev.trailing_zeros() as usize;
+            ev &= ev - 1;
+            if flips >> q & 1 == 1 && !in_tok {
+                (start, in_tok) = (at + q, true);
+            } else if flips >> q & 1 == 1 {
+                in_tok = false;
+                let (s, e) = (start, at + q);
+                if id_next {
+                    doc = text[s..e].iter().fold(0, |a, &b| a * 10 + (b - b'0') as u32);
+                    id_next = false;
+                    seq.clear();
+                    cand.clear();
+                    continue;
+                }
+                // Alphanumeric bytes OR 0x20 are their lowercase; tokens over 32
+                // bytes never equal a query term.
+                let t = match e - s {
+                    l @ ..=16 => {
+                        let raw = u128::from_le_bytes(text[s..s + 16].try_into().unwrap());
+                        p.short.get(&((raw | 0x2020_2020_2020_2020_2020_2020_2020_2020) & (!0 >> (128 - 8 * l))))
+                    }
+                    ..=32 => p.terms.get(&text[s..e].iter().map(|b| b | 0x20).collect::<Vec<u8>>()[..]),
+                    _ => None,
+                };
+                let &(bid, pid) = t.unwrap_or(&(NO, NO));
+                if bid != NO && sl.last[bid as usize] != doc {
+                    sl.last[bid as usize] = doc;
+                    sl.log.push(bid);
+                }
+                if let Some(&prev) = seq.last() {
+                    let h = pair(prev, pid).1;
+                    if p.bloom[h / 64] >> (h % 64) & 1 != 0 {
+                        cand.push(seq.len());
+                    }
+                }
+                seq.push(pid);
             }
-            seq.push(pid);
-            len = 0;
+            if nl >> q & 1 == 1 {
+                sl.docs.push((doc, sl.log.len() as u32));
+                for &j in cand.iter() {
+                    for &(ph, a) in p.pairs.get(&pair(seq[j - 1], seq[j]).0).into_iter().flatten() {
+                        let v = &mut sl.phr[ph as usize];
+                        if j > a && seq[j - 1 - a..].starts_with(&p.phrases[ph as usize]) && v.last() != Some(&doc) {
+                            v.push(doc);
+                        }
+                    }
+                }
+                id_next = true;
+                if base + (at + q + 1) as u64 >= end {
+                    return false;
+                }
+            }
         }
     }
-    sl.docs.push((doc, sl.log.len() as u32));
-    for j in 1..seq.len() {
-        let (k, h) = pair(seq[j - 1], seq[j]);
-        if p.bloom[h / 64] >> (h % 64) & 1 == 0 {
-            continue;
-        }
-        for &(ph, a) in p.pairs.get(&k).into_iter().flatten() {
-            if j > a && seq[j - 1 - a..].starts_with(&p.phrases[ph as usize]) {
-                push(&mut sl.phr[ph as usize], doc);
-            }
-        }
-    }
+    true
 }
 
 /// Elements of `a` that are (`want`) or are not in `b`; binary search when `b` is much larger.
