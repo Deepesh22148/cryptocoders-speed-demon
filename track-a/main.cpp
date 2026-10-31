@@ -11,7 +11,7 @@
 using namespace std;
 typedef uint32_t u32; typedef uint64_t u64; typedef uint16_t u16; typedef uint8_t u8;
 
-constexpr u64 CH = 256 << 10;                 // bytes per work chunk
+constexpr u64 CH = 64 << 10;                 // bytes per work chunk
 constexpr size_t HRS = 72, MAXE = 4096;       // the span is 72 hours from 2026-10-30T18:00Z; 1842 endpoints
 constexpr u32 BLK = 640, BSZ = 4096;          // one page: 640 latencies (u32) then 640 metas (u16: endpoint | is5xx << 15)
 
