@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
@@ -36,44 +37,111 @@ static inline u64 readNum(const char*& p, const char* end) {
     return x;
 }
 
-static std::vector<u32> off, indeg;
-static std::vector<Edge> adj;
+// Forward CSR (dir 0) and reverse CSR (dir 1).
+static std::vector<u32> offs[2];
+static std::vector<Edge> adjs[2];
 
-struct Scratch {
-    u64* dist; u32* stamp; u32 epoch = 0;
-    std::vector<std::pair<u64, u32>> heap;
-    explicit Scratch(size_t n) {
-        dist = (u64*)malloc(n * sizeof(u64));
-        stamp = (u32*)calloc(n, sizeof(u32));
+// ---- 4-ary min-heap with lazy deletion ----
+struct Ent { u64 k; u32 v; };
+
+struct Heap4 {
+    std::vector<Ent> a;
+    bool empty() const { return a.empty(); }
+    size_t size() const { return a.size(); }
+    void clear() { a.clear(); }
+    const Ent& top() const { return a[0]; }
+    void push(Ent e) {
+        a.push_back(e);
+        size_t i = a.size() - 1;
+        while (i > 0) {
+            size_t p = (i - 1) >> 2;
+            if (a[p].k <= e.k) break;
+            a[i] = a[p];
+            i = p;
+        }
+        a[i] = e;
+    }
+    Ent pop() {
+        Ent res = a[0];
+        Ent e = a.back();
+        a.pop_back();
+        size_t n = a.size();
+        if (n) {
+            size_t i = 0;
+            for (;;) {
+                size_t c = i * 4 + 1;
+                if (c >= n) break;
+                size_t best = c, end = std::min(c + 4, n);
+                for (size_t j = c + 1; j < end; ++j)
+                    if (a[j].k < a[best].k) best = j;
+                if (a[best].k >= e.k) break;
+                a[i] = a[best];
+                i = best;
+            }
+            a[i] = e;
+        }
+        return res;
     }
 };
 
+// dist + stamp packed together: one cache line touch per node visit.
+struct __attribute__((packed)) Lab { u64 d; u32 stamp; };
+
+struct Scratch {
+    Lab* lab[2];
+    u32 epoch = 0;
+    Heap4 heap[2];
+    explicit Scratch(size_t n) {
+        for (int s = 0; s < 2; ++s) lab[s] = (Lab*)calloc(n, sizeof(Lab));
+    }
+};
+
+static std::vector<u32> indeg;
+
 static i64 solve(Scratch& S, u32 s, u32 t) {
     if (s == t) return 0;
-    if (indeg[t] == 0 || off[s] == off[s + 1]) return -1;
-    auto cmp = [](const std::pair<u64, u32>& a, const std::pair<u64, u32>& b) { return a.first > b.first; };
-    ++S.epoch;
-    S.heap.clear();
-    S.dist[s] = 0; S.stamp[s] = S.epoch;
-    S.heap.push_back({0, s});
-    while (!S.heap.empty()) {
-        std::pop_heap(S.heap.begin(), S.heap.end(), cmp);
-        auto [d, u] = S.heap.back();
-        S.heap.pop_back();
-        if (d > S.dist[u]) continue;
-        if (u == t) return (i64)d;
-        for (u32 i = off[u]; i < off[u + 1]; ++i) {
+    if (indeg[t] == 0 || offs[0][s] == offs[0][s + 1]) return -1;
+
+    const u64 INF = ~0ULL;
+    u64 mu = INF;
+    u32 ep = ++S.epoch;
+    S.heap[0].clear(); S.heap[1].clear();
+    S.lab[0][s] = {0, ep}; S.heap[0].push({0, s});
+    S.lab[1][t] = {0, ep}; S.heap[1].push({0, t});
+
+    for (;;) {
+        // drop stale tops so the stopping bound is tight
+        for (int side = 0; side < 2; ++side) {
+            Heap4& H = S.heap[side];
+            while (!H.empty() && H.top().k > S.lab[side][H.top().v].d) H.pop();
+        }
+        if (S.heap[0].empty() || S.heap[1].empty()) break;
+        if (S.heap[0].top().k + S.heap[1].top().k >= mu) break;
+
+        int side = S.heap[0].size() <= S.heap[1].size() ? 0 : 1;
+        Ent e = S.heap[side].pop();
+        u32 u = e.v;
+        u64 d = e.k;
+        const u32* off = offs[side].data();
+        const Edge* adj = adjs[side].data();
+        Lab* mine = S.lab[side];
+        Lab* other = S.lab[side ^ 1];
+        Heap4& H = S.heap[side];
+        for (u32 i = off[u], iend = off[u + 1]; i < iend; ++i) {
             u32 v = adj[i].to;
             u64 nd = d + adj[i].w;
-            if (S.stamp[v] != S.epoch || nd < S.dist[v]) {
-                S.stamp[v] = S.epoch;
-                S.dist[v] = nd;
-                S.heap.push_back({nd, v});
-                std::push_heap(S.heap.begin(), S.heap.end(), cmp);
+            if (mine[v].stamp != ep || nd < mine[v].d) {
+                mine[v].stamp = ep;
+                mine[v].d = nd;
+                H.push({nd, v});
+            }
+            if (other[v].stamp == ep) {
+                u64 cand = nd + other[v].d;
+                if (cand < mu) mu = cand;
             }
         }
     }
-    return -1;
+    return mu == INF ? -1 : (i64)mu;
 }
 
 int main() {
@@ -85,19 +153,31 @@ int main() {
 
     std::vector<u32> eu, ev, ew;
     eu.reserve(m); ev.reserve(m); ew.reserve(m);
-    off.assign(n + 1, 0);
+    offs[0].assign(n + 1, 0);
+    offs[1].assign(n + 1, 0);
     indeg.assign(n, 0);
     for (size_t i = 0; i < m; ++i) {
         u32 u = (u32)readNum(p, gend), v = (u32)readNum(p, gend), w = (u32)readNum(p, gend);
         if (u == v) continue;  // a self-loop never shortens a path
         eu.push_back(u); ev.push_back(v); ew.push_back(w);
-        ++off[u + 1];
+        ++offs[0][u + 1];
+        ++offs[1][v + 1];
         ++indeg[v];
     }
-    for (size_t i = 0; i < n; ++i) off[i + 1] += off[i];
-    adj.resize(eu.size());
-    std::vector<u32> pos(off.begin(), off.end() - 1);
-    for (size_t i = 0; i < eu.size(); ++i) adj[pos[eu[i]]++] = {ev[i], ew[i]};
+    for (int s = 0; s < 2; ++s)
+        for (size_t i = 0; i < n; ++i) offs[s][i + 1] += offs[s][i];
+
+    size_t E = eu.size();
+    adjs[0].resize(E);
+    adjs[1].resize(E);
+    {
+        std::vector<u32> pf(offs[0].begin(), offs[0].end() - 1);
+        std::vector<u32> pb(offs[1].begin(), offs[1].end() - 1);
+        for (size_t i = 0; i < E; ++i) {
+            adjs[0][pf[eu[i]]++] = {ev[i], ew[i]};
+            adjs[1][pb[ev[i]]++] = {eu[i], ew[i]};
+        }
+    }
     std::vector<u32>().swap(eu); std::vector<u32>().swap(ev); std::vector<u32>().swap(ew);
 
     size_t qlen;
@@ -113,20 +193,33 @@ int main() {
 
     std::vector<i64> ans(queries.size());
     std::atomic<size_t> next{0};
-    unsigned nthreads = 12;
+    unsigned nthreads = 12;  // tune to the scorer's core count
+    if (nthreads > queries.size()) nthreads = (unsigned)std::max<size_t>(1, queries.size());
     std::vector<std::thread> pool;
     for (unsigned k = 0; k < nthreads; ++k) {
         pool.emplace_back([&] {
             Scratch S(n);
+            constexpr size_t CHUNK = 16;  // fewer atomic hits
             size_t i;
-            while ((i = next.fetch_add(1)) < queries.size())
-                ans[i] = solve(S, queries[i].first, queries[i].second);
+            while ((i = next.fetch_add(CHUNK)) < queries.size()) {
+                size_t hi = std::min(i + CHUNK, queries.size());
+                for (; i < hi; ++i) ans[i] = solve(S, queries[i].first, queries[i].second);
+            }
         });
     }
     for (auto& th : pool) th.join();
 
     std::string out;
-    for (i64 a : ans) { out += std::to_string(a); out += '\n'; }
+    out.reserve(ans.size() * 12);
+    char buf[24];
+    for (i64 a : ans) {
+        if (a < 0) { out += "-1\n"; continue; }
+        int len = 0;
+        u64 x = (u64)a;
+        do { buf[len++] = '0' + x % 10; x /= 10; } while (x);
+        while (len) out += buf[--len];
+        out += '\n';
+    }
     FILE* f = fopen("/out/distances.txt", "wb");
     if (!f) { perror("/out/distances.txt"); return 1; }
     fwrite(out.data(), 1, out.size(), f);
