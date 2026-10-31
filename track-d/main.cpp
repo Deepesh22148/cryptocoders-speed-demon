@@ -94,32 +94,30 @@ int main(){
     }
   });
 
-  // adjacency from the edge list P: bucket by node range (counting sort without atomics), then build each bucket
-  // inside the cache. d=0 forward (keyed by u), d=1 reverse (keyed by v).
-  // 2048-node buckets: key low bits and the other end (n < 2^21) pack into 32 bits
-  const int SH=11; size_t B=(n>>SH)+1,E=0;
+  const int SH=15; size_t B=(n>>SH)+1,E=0,bk=(n+NC-1)/NC;
+  auto each=[&](int d,size_t k,auto f){
+    if(!d){for(auto&e:P[k])f(e);}
+    else F(u,k*bk,min(n,(k+1)*bk))F(i,off[0][u],off[0][u+1])f(E3{{(u32)u,adj[0][i].to,adj[0][i].w}});
+  };
   vector<size_t>C(NC*B),bs(B+1);
-  auto build=[&](int d){
+  F(d,0,2){
     fill(C.begin(),C.end(),0);
-    dyn(NC,[&](size_t k){for(auto&e:P[k])++C[k*B+(e.a[d]>>SH)];});
+    dyn(NC,[&](size_t k){each(d,k,[&](const E3&e){++C[k*B+(e.a[d]>>SH)];});});
     size_t r=0; F(b,0,B){bs[b]=r;F(k,0,NC){size_t c=C[k*B+b];C[k*B+b]=r;r+=c;}} bs[B]=E=r;
-    Edge*tmp=new Edge[E+1];
-    dyn(NC,[&](size_t k){for(auto&e:P[k])tmp[C[k*B+(e.a[d]>>SH)]++]={(e.a[d]&2047)|e.a[1-d]<<11,e.a[2]};});
-    if(d)P=vector<vector<E3>>();   // the reverse build is the last use of the edge list
+    E3*tmp=new E3[E+1];
+    dyn(NC,[&](size_t k){each(d,k,[&](const E3&e){tmp[C[k*B+(e.a[d]>>SH)]++]=e;});});
+    if(!d){P.clear();P.shrink_to_fit();}
     off[d]=(u32*)malloc((n+1)*4); adj[d]=(Edge*)malloc((E+1)*8); off[d][n]=E;
     dyn(B,[&](size_t b){
       size_t lo=b<<SH,hi=min(n,(b+1)<<SH),i0=bs[b],i1=bs[b+1];
       vector<u32>c(hi>lo?hi-lo:0);
-      F(i,i0,i1)++c[tmp[i].to&2047];
+      F(i,i0,i1)++c[tmp[i].a[d]-lo];
       u32 r=i0; F(j,0,c.size()){u32 x=c[j];off[d][lo+j]=r;c[j]=r;r+=x;}
-      F(i,i0,i1){auto&e=tmp[i];adj[d][c[e.to&2047]++]={e.to>>11,e.w};}
+      F(i,i0,i1){auto&e=tmp[i];adj[d][c[e.a[d]-lo]++]={e.a[1-d],e.a[2]};}
     });
     delete[]tmp;
-  };
-  build(0);
+  }
 
-  // locality: if ids look scattered, number nodes in cells of ~2048 grown over the forward graph, relabel the
-  // edge list, and build the final adjacency in that order
   vector<u32>nid;
   {
     u64 nr=0,tot=0; size_t sd=max<size_t>(1,n/200000);
@@ -129,15 +127,15 @@ int main(){
     if(tot&&nr*10<tot*6&&n>1){
       vector<char>vis(n);
       auto claim=[&](u32 v){return !vis[v]&&!__atomic_exchange_n(&vis[v],1,__ATOMIC_RELAXED);};
-      auto grow=[&](vector<u32>&q){   // BFS balls of ~2048 nodes; each next ball starts at the newest boundary node
+      auto grow=[&](vector<u32>&q){   // cell-wise growth: BFS balls of ~2048 nodes, each next ball starts at the newest boundary node
         vector<u32> Fr,lq; Fr.push_back(q[0]);
         while(!Fr.empty()){
           lq.assign(1,Fr.back()); Fr.pop_back(); size_t h=0,cnt=0;
-          while(h<lq.size()&&cnt<2048){
-            if(h+8<lq.size())__builtin_prefetch(off[0]+lq[h+8]);
-            if(h+4<lq.size())__builtin_prefetch(adj[0]+off[0][lq[h+4]]);
+          while(h<lq.size()&&cnt<512){
+            if(h+8<lq.size())F(d,0,2)__builtin_prefetch(off[d]+lq[h+8]);
+            if(h+4<lq.size())F(d,0,2)__builtin_prefetch(adj[d]+off[d][lq[h+4]]);
             u32 u=lq[h++];
-            for(u32 i=off[0][u];i<off[0][u+1];++i){u32 v=adj[0][i].to;if(claim(v)){q.push_back(v);lq.push_back(v);++cnt;}}
+            F(d,0,2)for(u32 i=off[d][u];i<off[d][u+1];++i){u32 v=adj[d][i].to;if(claim(v)){q.push_back(v);lq.push_back(v);++cnt;}}
           }
           for(size_t i=lq.size();i-->h;)Fr.push_back(lq[i]);
         }
@@ -148,16 +146,21 @@ int main(){
         u32 s=(u64)n*k/NT; if(claim(s)){q.push_back(s);grow(q);}
       });
       F(r,0,n)if(claim(r)){L[NT].push_back(r);grow(L[NT]);}
-      size_t pos=0; vector<size_t> st(NT+1);
-      F(k,0,NT+1){st[k]=pos;pos+=L[k].size();}
-      nid.resize(n);
-      par(NT+1,[&](unsigned k){F(j,0,L[k].size())nid[L[k][j]]=st[k]+j;});
-      free(off[0]);free(adj[0]);
-      dyn(NC,[&](size_t k){for(auto&e:P[k]){e.a[0]=nid[e.a[0]];e.a[1]=nid[e.a[1]];}});
-      build(0);
+      vector<u32>ord; ord.reserve(n);
+      for(auto&q:L)ord.insert(ord.end(),q.begin(),q.end());
+      size_t bt=(n+NT-1)/NT; nid.resize(n);
+      par(NT,[&](unsigned k){F(i,k*bt,min(n,(k+1)*bt))nid[ord[i]]=i;});
+      F(d,0,2){
+        u32*no=(u32*)malloc((n+1)*4); Edge*na=(Edge*)malloc((E+1)*8); no[0]=0;
+        par(NT,[&](unsigned k){F(i,k*bt,min(n,(k+1)*bt))no[i+1]=off[d][ord[i]+1]-off[d][ord[i]];});
+        F(i,0,n)no[i+1]+=no[i];
+        par(NT,[&](unsigned k){
+          F(i,k*bt,min(n,(k+1)*bt)){u32 w=no[i],o=ord[i];F(j,off[d][o],off[d][o+1])na[w++]={nid[adj[d][j].to],adj[d][j].w};}
+        });
+        free(off[d]);free(adj[d]);off[d]=no;adj[d]=na;
+      }
     }
   }
-  build(1);
 
   vector<pair<u32,u32>>Q; {ifstream f("/data/queries.txt");u32 s,t;while(f>>s>>t){if(nid.size()){s=nid[s];t=nid[t];}Q.push_back({s,t});}}
   vector<long long>ans(Q.size()); vector<u32>od(Q.size()); iota(od.begin(),od.end(),0);
