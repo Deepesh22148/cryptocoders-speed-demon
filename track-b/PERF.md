@@ -19,9 +19,12 @@ How correctness was checked:
 | 1 | Adaptive intersect/difference, rarest-anchor phrases | ~14.2 s (real data); 42 s on synthetic | Pending |
 | 2 | Whole-file reads, Fx hash, query terms interned to ids, parallel indexing over line-aligned slices, parallel query blocks, LTO | 7.5 s | Pending |
 | 3 | Slices are never merged: each owns a disjoint ascending doc range, so every answer is the concatenation of per-slice answers (the merge cost ~1 s) | 2.5 s | Pending |
-| 4 | Positional postings removed: each doc stores its token-id stream (sequential pushes), and phrases intersect doc lists then match the id window around the rarest term | 2.2 s | Pending |
+| 4 | Positional postings removed: each doc stores its token-id stream (sequential pushes), and phrases intersect doc lists then match the id window around the rarest term | 2.2 s | board: 0.821 s, 585 MB, 383 lines, K 8.70 |
+| 5 | Stream docs.txt per thread instead of reading it whole; token streams as u16 phrase ids; single source file, leftover Python reference and in-tree tests removed (they counted toward S) | 2.0 s, peak 548 → 243 MB, ~262 formatted lines | Pending |
 
 Phase split after step 4: read ~0.15 s, index ~0.9 s, queries ~0.9 s.
+
+Scoring is `K = (T_ref/T)^0.5 x min(M_ref/M, 50)^0.2 x min(S_ref/S, 1)^0.15`, with T_ref 56.35 s, M_ref 2.2 GB and S_ref 91 lines. After step 4 the factors were time 8.28, memory 1.30 and size 0.81. Step 5 goes after memory and size.
 
 ## Tried and reverted
 
