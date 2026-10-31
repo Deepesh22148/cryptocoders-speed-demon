@@ -21,6 +21,7 @@ How correctness was checked:
 | 3 | Slices are never merged: each owns a disjoint ascending doc range, so every answer is the concatenation of per-slice answers (the merge cost ~1 s) | 2.5 s | Pending |
 | 4 | Positional postings removed: each doc stores its token-id stream (sequential pushes), and phrases intersect doc lists then match the id window around the rarest term | 2.2 s | board: 0.821 s, 585 MB, 383 lines, K 8.70 |
 | 5 | Stream docs.txt per thread instead of reading it whole; token streams as u16 phrase ids; single source file, leftover Python reference and in-tree tests removed (they counted toward S) | 2.0 s, peak 548 → 243 MB, ~262 formatted lines | Pending |
+| 6 | Phrases matched during the scan: each phrase is keyed by its longest-word adjacent pid pair (behind a 1M-bit filter) and verified on the doc's transient pid buffer, so no per-token storage and no phrase query work. BOOL postings built as an append-only log per slice, then counting-sorted into CSR (one allocation instead of ~2.4M reallocations). Tokens of up to 16 bytes are looked up by a packed u128 key | 1.0 s (min of 7), peak 147 MB | Pending |
 
 Phase split after step 4: read ~0.15 s, index ~0.9 s, queries ~0.9 s.
 
