@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
   u64 fz = sb.st_size;
   int ofd = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (!fz) return 0;
-  unsigned T = 12; { cpu_set_t c; if (!sched_getaffinity(0, sizeof c, &c)) T = min<int>(T, max(1, CPU_COUNT(&c))); }
+  unsigned T = 8; { cpu_set_t c; if (!sched_getaffinity(0, sizeof c, &c)) T = min<int>(T, max(1, CPU_COUNT(&c))); }
 
   const size_t NC = (fz + CH - 1) / CH, maxBlocks = fz / 40 / BLK + HRS * T + 16;   // a line is >= 40 bytes
   char* pool = (char*)mmap(nullptr, maxBlocks * BSZ, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
