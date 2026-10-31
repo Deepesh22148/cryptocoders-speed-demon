@@ -11,7 +11,7 @@
 using namespace std;
 typedef uint32_t u32; typedef uint64_t u64; typedef uint16_t u16; typedef uint8_t u8;
 
-constexpr u64 CH = 128 << 10;                 // bytes per work chunk
+constexpr u64 CH = 256 << 10;                 // bytes per work chunk
 constexpr size_t HRS = 72, MAXE = 4096;       // the span is 72 hours from 2026-10-30T18:00Z; 1842 endpoints
 constexpr u32 BLK = 640, BSZ = 4096;          // one page: 640 latencies (u32) then 640 metas (u16: endpoint | is5xx << 15)
 
@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
   u64 fz = sb.st_size;
   int ofd = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (!fz) return 0;
-  unsigned T = 8; { cpu_set_t c; if (!sched_getaffinity(0, sizeof c, &c)) T = min<int>(T, max(1, CPU_COUNT(&c))); }
+  unsigned T = 12; { cpu_set_t c; if (!sched_getaffinity(0, sizeof c, &c)) T = min<int>(T, max(1, CPU_COUNT(&c))); }
 
   const size_t NC = (fz + CH - 1) / CH, maxBlocks = fz / 40 / BLK + HRS * T + 16;   // a line is >= 40 bytes
   char* pool = (char*)mmap(nullptr, maxBlocks * BSZ, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
