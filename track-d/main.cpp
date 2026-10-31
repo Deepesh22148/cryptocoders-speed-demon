@@ -21,26 +21,24 @@ static u64 num(const char*&p,const char*e){
 template<class L>struct Ent{L k;u32 v;};
 template<class L>struct Lb{L l[2];}; // fwd+bwd labels of one node side by side: one cache line per relaxation
 
-template<class L>struct Heap{ // 4-ary min-heap, lazy deletion
-  vector<Ent<L>>a;
-  void push(Ent<L> e){
-    size_t i=a.size(); a.push_back(e);
-    for(;i&&a[(i-1)>>2].k>e.k;i=(i-1)>>2)a[i]=a[(i-1)>>2];
-    a[i]=e;
-  }
-  void pop(){
-    Ent<L> e=a.back(); a.pop_back();
-    size_t n=a.size(),i=0;
-    if(!n)return;
-    for(size_t c;(c=4*i+1)<n;){
-      size_t b=c; for(size_t j=c+1;j<min(c+4,n);++j)if(a[j].k<a[b].k)b=j;
-      if(a[b].k>=e.k)break;
-      a[i]=a[b]; i=b;
+template<class L>struct Heap{ // monotone radix heap (keys never drop below the last extracted key), lazy deletion
+  vector<Ent<L>> bk[65]; size_t sz=0; u64 last=0;
+  bool empty()const{return !sz;}
+  void clear(){for(auto&b:bk)b.clear();sz=0;last=0;}
+  static int bi(u64 x,u64 l){return x==l?0:64-__builtin_clzll(x^l);}
+  void push(Ent<L> e){bk[bi(e.k,last)].push_back(e);++sz;}
+  u64 top(){ // minimum key; makes bucket 0 hold exactly the minimum
+    if(bk[0].empty()){
+      int i=1; while(bk[i].empty())++i;
+      u64 m=~0ULL; for(auto&e:bk[i])m=min<u64>(m,e.k);
+      last=m; vector<Ent<L>> t; t.swap(bk[i]);
+      for(auto&e:t)bk[bi(e.k,last)].push_back(e);
+      t.clear(); bk[i].swap(t);
     }
-    a[i]=e;
+    return last;
   }
+  Ent<L> pop(){top(); Ent<L> e=bk[0].back(); bk[0].pop_back(); --sz; return e;}
 };
-
 template<class L>struct Sc{Lb<L>*lab=nullptr;vector<u32>T[2];Heap<L>h[2];}; // label = dist+1, 0 = unlabeled
 
 // Bidirectional Dijkstra. Returns -1 if unreachable, -2 if a u32 label would overflow.
@@ -48,10 +46,10 @@ template<class L>static long long solve(Sc<L>&S,u32 s,u32 t){
   if(s==t)return 0;
   if(off[0][s]==off[0][s+1]||off[1][t]==off[1][t+1])return -1;
   u64 mu=~0ULL; u32 st[2]={s,t}; bool ov=false; Lb<L>*lab=S.lab;
-  for(int d=0;d<2;++d){S.h[d].a.clear();lab[st[d]].l[d]=1;S.T[d].push_back(st[d]);S.h[d].push({0,st[d]});}
-  while(!S.h[0].a.empty()&&!S.h[1].a.empty()&&(u64)S.h[0].a[0].k+S.h[1].a[0].k<mu){
-    int d=S.h[0].a.size()<=S.h[1].a.size()?0:1;
-    Heap<L>&h=S.h[d]; Ent<L> e=h.a[0]; h.pop();
+  for(int d=0;d<2;++d){S.h[d].clear();lab[st[d]].l[d]=1;S.T[d].push_back(st[d]);S.h[d].push({0,st[d]});}
+  while(!S.h[0].empty()&&!S.h[1].empty()&&S.h[0].top()+S.h[1].top()<mu){
+    int d=S.h[0].sz<=S.h[1].sz?0:1;
+    Heap<L>&h=S.h[d]; Ent<L> e=h.pop();
     const Edge*A=adj[d];
     u32 i0=off[d][e.v],i1=off[d][e.v+1];
     for(u32 i=i0;i<i1;++i)__builtin_prefetch(lab+A[i].to);
@@ -63,7 +61,7 @@ template<class L>static long long solve(Sc<L>&S,u32 s,u32 t){
       if(x.l[d^1])mu=min(mu,nd+x.l[d^1]-1);
     }
     if(ov)break;
-    while(!h.a.empty()&&(u64)lab[h.a[0].v].l[d]<(u64)h.a[0].k+1)h.pop(); // keep the top valid
+    while(!h.empty()){ u64 k=h.top(); Ent<L>&t=h.bk[0].back(); if((u64)lab[t.v].l[d]<k+1){h.bk[0].pop_back();--h.sz;} else break; }
   }
   for(int d=0;d<2;++d){for(u32 v:S.T[d])lab[v].l[d]=0;S.T[d].clear();}
   if(ov)return -2;
@@ -129,12 +127,17 @@ int main(){
     if(tot&&nr*10<tot*6&&n>1){
       vector<char>vis(n);
       auto claim=[&](u32 v){return !vis[v]&&!__atomic_exchange_n(&vis[v],1,__ATOMIC_RELAXED);};
-      auto grow=[&](vector<u32>&q){
-        for(size_t h=0;h<q.size();++h){
-          u32 u=q[h];
-          if(h+16<q.size())F(d,0,2)__builtin_prefetch(off[d]+q[h+16]);
-          if(h+8<q.size())F(d,0,2)__builtin_prefetch(adj[d]+off[d][q[h+8]]);
-          F(d,0,2)for(u32 i=off[d][u];i<off[d][u+1];++i)if(claim(adj[d][i].to))q.push_back(adj[d][i].to);
+      auto grow=[&](vector<u32>&q){   // cell-wise growth: BFS balls of ~2048 nodes, each next ball starts at the newest boundary node
+        vector<u32> Fr,lq; Fr.push_back(q[0]);
+        while(!Fr.empty()){
+          lq.assign(1,Fr.back()); Fr.pop_back(); size_t h=0,cnt=0;
+          while(h<lq.size()&&cnt<2048){
+            if(h+8<lq.size())F(d,0,2)__builtin_prefetch(off[d]+lq[h+8]);
+            if(h+4<lq.size())F(d,0,2)__builtin_prefetch(adj[d]+off[d][lq[h+4]]);
+            u32 u=lq[h++];
+            F(d,0,2)for(u32 i=off[d][u];i<off[d][u+1];++i){u32 v=adj[d][i].to;if(claim(v)){q.push_back(v);lq.push_back(v);++cnt;}}
+          }
+          for(size_t i=lq.size();i-->h;)Fr.push_back(lq[i]);
         }
       };
       vector<vector<u32>>L(NT+1);
