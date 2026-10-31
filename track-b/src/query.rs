@@ -1,278 +1,131 @@
-use crate::index::InvertedIndex;
-use crate::parser::{BoolOp, Query};
+use std::borrow::Cow;
+use std::io::Write;
 
-// Intersect two sorted, unique document-ID lists.
+use crate::index::Slice;
+use crate::parser::{Op, Query};
+
+// Intersect two sorted, unique id lists; binary search when sizes are skewed.
 fn intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
-    if a.is_empty() || b.is_empty() {
-        return Vec::new();
-    }
-
-    // For highly skewed lists, binary searches avoid scanning the much
-    // larger list. The threshold is deliberately conservative.
-    if a.len() <= b.len() / 8 {
-        let mut result = Vec::with_capacity(a.len().min(b.len()));
-        let mut lower = 0usize;
-
-        for &doc_id in a {
-            if lower >= b.len() {
-                break;
+    let (a, b) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    let mut out = Vec::with_capacity(a.len());
+    if a.len() * 8 <= b.len() {
+        let mut rest = b;
+        for &x in a {
+            let i = rest.partition_point(|&y| y < x);
+            if i < rest.len() && rest[i] == x {
+                out.push(x);
             }
-
-            match b[lower..].binary_search(&doc_id) {
-                Ok(offset) => {
-                    let found = lower + offset;
-                    result.push(doc_id);
-                    lower = found + 1;
-                }
-                Err(offset) => lower += offset,
-            }
+            rest = &rest[i..];
         }
-
-        return result;
+        return out;
     }
-
-    if b.len() <= a.len() / 8 {
-        return intersect(b, a);
-    }
-
-    let mut result = Vec::with_capacity(a.len().min(b.len()));
-    let (mut i, mut j) = (0usize, 0usize);
-
+    let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
-        if a[i] < b[j] {
-            i += 1;
-        } else if a[i] > b[j] {
-            j += 1;
-        } else {
-            result.push(a[i]);
-            i += 1;
-            j += 1;
+        let (x, y) = (a[i], b[j]);
+        if x == y {
+            out.push(x);
         }
+        i += (x <= y) as usize;
+        j += (y <= x) as usize;
     }
-
-    result
+    out
 }
 
-// Union of two sorted, unique document-ID lists.
 fn union(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let mut result = Vec::with_capacity(a.len() + b.len());
-    let (mut i, mut j) = (0usize, 0usize);
-
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
-        if a[i] < b[j] {
-            result.push(a[i]);
-            i += 1;
-        } else if a[i] > b[j] {
-            result.push(b[j]);
-            j += 1;
-        } else {
-            result.push(a[i]);
-            i += 1;
-            j += 1;
-        }
+        let (x, y) = (a[i], b[j]);
+        out.push(x.min(y));
+        i += (x <= y) as usize;
+        j += (y <= x) as usize;
     }
-
-    result.extend_from_slice(&a[i..]);
-    result.extend_from_slice(&b[j..]);
-    result
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    out
 }
 
-// A NOT B = A AND NOT B.
+// a \ b
 fn difference(a: &[u32], b: &[u32]) -> Vec<u32> {
-    if a.is_empty() || b.is_empty() {
-        return a.to_vec();
-    }
-
-    // When B is much larger, binary-search each value from A.
-    if a.len() <= b.len() / 8 {
-        let mut result = Vec::with_capacity(a.len());
-        for &doc_id in a {
-            if b.binary_search(&doc_id).is_err() {
-                result.push(doc_id);
+    let mut out = Vec::with_capacity(a.len());
+    if a.len() * 8 <= b.len() {
+        let mut rest = b;
+        for &x in a {
+            let i = rest.partition_point(|&y| y < x);
+            if i == rest.len() || rest[i] != x {
+                out.push(x);
             }
+            rest = &rest[i..];
         }
-        return result;
+        return out;
     }
-
-    let mut result = Vec::with_capacity(a.len());
-    let mut j = 0usize;
-
-    for &doc_id in a {
-        while j < b.len() && b[j] < doc_id {
+    let mut j = 0;
+    for &x in a {
+        while j < b.len() && b[j] < x {
             j += 1;
         }
-
-        if j == b.len() || b[j] != doc_id {
-            result.push(doc_id);
+        if j == b.len() || b[j] != x {
+            out.push(x);
         }
     }
-
-    result
+    out
 }
 
-// Retrieve the sorted document IDs for a term.
-fn get_posting<'a>(index: &'a InvertedIndex, term: &[u8]) -> &'a [u32] {
-    match index.term_ids.get(term) {
-        Some(&term_id) => &index.postings[term_id].docs,
-        None => &[],
+fn run_bool<'a>(post: &'a [Vec<u32>], terms: &[u32], ops: &[Op]) -> Cow<'a, [u32]> {
+    let mut r = Cow::Borrowed(&post[terms[0] as usize][..]);
+    for (op, &t) in ops.iter().zip(&terms[1..]) {
+        let s = &post[t as usize];
+        r = Cow::Owned(match op {
+            Op::And => intersect(&r, s),
+            Op::Or => union(&r, s),
+            Op::Not => difference(&r, s),
+        });
     }
+    r
 }
 
-// Boolean operators must be evaluated strictly left-to-right.
-fn execute_bool(
-    index: &InvertedIndex,
-    terms: &[Vec<u8>],
-    operators: &[BoolOp],
-) -> Vec<u32> {
-    if terms.is_empty() {
-        return Vec::new();
+// Docs holding every term, rarest list first, then an exact check of each
+// one's token-id stream. Phrase answers are tiny, so no positions are kept.
+fn run_phrase(s: &Slice, terms: &[u32]) -> Vec<u32> {
+    let mut lists: Vec<&[u32]> = terms.iter().map(|&t| &s.post[t as usize][..]).collect();
+    lists.sort_unstable_by_key(|l| l.len());
+    let mut cand = lists[0].to_vec();
+    for l in &lists[1..] {
+        if cand.is_empty() {
+            break;
+        }
+        cand = intersect(&cand, l);
     }
+    // Find the rarest term in the stream, then compare the window around it.
+    let r = (0..terms.len()).min_by_key(|&k| s.post[terms[k] as usize].len()).unwrap();
+    cand.retain(|&d| {
+        let i = (d - s.first) as usize;
+        let seq = &s.toks[s.starts[i] as usize..s.starts[i + 1] as usize];
+        (r..(seq.len() + r + 1).saturating_sub(terms.len()))
+            .any(|j| seq[j] == terms[r] && &seq[j - r..j - r + terms.len()] == terms)
+    });
+    cand
+}
 
-    let mut result = get_posting(index, &terms[0]).to_vec();
-
-    for (i, operator) in operators.iter().enumerate() {
-        let next = get_posting(index, &terms[i + 1]);
-
-        result = match operator {
-            BoolOp::And => intersect(&result, next),
-            BoolOp::Or => union(&result, next),
-            BoolOp::Not => difference(&result, next),
+/// Append `count sum id1..id10\n` for one query, answered slice by slice.
+pub fn answer(slices: &[Slice], q: &Query, out: &mut Vec<u8>) {
+    let (mut count, mut sum) = (0usize, 0u64);
+    let mut first: Vec<u32> = Vec::with_capacity(10);
+    for s in slices {
+        let ids: Cow<[u32]> = match q {
+            Query::Bool { terms, ops } => run_bool(&s.post, terms, ops),
+            Query::Phrase(terms) => Cow::Owned(run_phrase(s, terms)),
         };
+        count += ids.len();
+        sum += ids.iter().map(|&x| x as u64).sum::<u64>();
+        let room = 10 - first.len();
+        first.extend(ids.iter().take(room));
     }
-
-    result
-}
-
-// Exact consecutive-token phrase matching.
-//
-// Optimization: use the rarest phrase term as the candidate-document anchor.
-// This can substantially reduce candidate documents for common first terms.
-// Position offsets are calculated relative to the anchor term, so phrase
-// order and exact adjacency remain unchanged.
-fn execute_phrase(index: &InvertedIndex, terms: &[Vec<u8>]) -> Vec<u32> {
-    if !(2..=8).contains(&terms.len()) {
-        return Vec::new();
+    write!(out, "{count} {sum}").unwrap();
+    for x in first {
+        write!(out, " {x}").unwrap();
     }
-
-    // Resolve term IDs once per query rather than once per candidate document.
-    let mut term_ids = Vec::with_capacity(terms.len());
-
-    for term in terms {
-        match index.term_ids.get(term.as_slice()) {
-            Some(&id) => term_ids.push(id),
-            None => return Vec::new(),
-        }
-    }
-
-    // All phrase terms should have positional postings, because the index
-    // builder marks every term appearing in a phrase.
-    let mut anchor_index = 0usize;
-    let mut anchor_len = usize::MAX;
-
-    for (i, &term_id) in term_ids.iter().enumerate() {
-        let posting = &index.postings[term_id];
-
-        if posting.positions.is_none() {
-            return Vec::new();
-        }
-
-        if posting.docs.len() < anchor_len {
-            anchor_len = posting.docs.len();
-            anchor_index = i;
-        }
-    }
-
-    let anchor_posting = &index.postings[term_ids[anchor_index]];
-    let anchor_positions = match &anchor_posting.positions {
-        Some(positions) => positions,
-        None => return Vec::new(),
-    };
-
-    let mut result = Vec::new();
-
-    // A phrase has at most eight terms. A fixed-size stack array avoids
-    // allocating a Vec of position-list references for every candidate doc.
-    'document: for (anchor_doc_index, &doc_id) in
-        anchor_posting.docs.iter().enumerate()
-    {
-        let mut position_lists: [&[u32]; 8] = [&[]; 8];
-
-        for term_index in 0..terms.len() {
-            if term_index == anchor_index {
-                position_lists[term_index] =
-                    &anchor_positions[anchor_doc_index];
-                continue;
-            }
-
-            let posting = &index.postings[term_ids[term_index]];
-
-            let positions = match &posting.positions {
-                Some(positions) => positions,
-                None => continue 'document,
-            };
-
-            let doc_index = match posting.docs.binary_search(&doc_id) {
-                Ok(i) => i,
-                Err(_) => continue 'document,
-            };
-
-            position_lists[term_index] = &positions[doc_index];
-        }
-
-        // Each anchor occurrence implies exactly one possible start position.
-        'occurrence: for &anchor_position in position_lists[anchor_index] {
-            for term_index in 0..terms.len() {
-                if term_index == anchor_index {
-                    continue;
-                }
-
-                let expected = anchor_position as i64
-                    + term_index as i64
-                    - anchor_index as i64;
-
-                if expected < 0 || expected > u32::MAX as i64 {
-                    continue 'occurrence;
-                }
-
-                if position_lists[term_index]
-                    .binary_search(&(expected as u32))
-                    .is_err()
-                {
-                    continue 'occurrence;
-                }
-            }
-
-            result.push(doc_id);
-            continue 'document;
-        }
-    }
-
-    result
-}
-
-// Execute one parsed query.
-pub fn execute_query(index: &InvertedIndex, query: &Query) -> Vec<u32> {
-    match query {
-        Query::Bool { terms, operators } => {
-            execute_bool(index, terms, operators)
-        }
-        Query::Phrase { terms } => execute_phrase(index, terms),
-    }
-}
-
-// Format: count sum first_id ... tenth_id.
-pub fn format_result(doc_ids: &[u32]) -> String {
-    let count = doc_ids.len();
-    let sum: u64 = doc_ids.iter().map(|&id| id as u64).sum();
-
-    let mut output = format!("{} {}", count, sum);
-
-    for &doc_id in doc_ids.iter().take(10) {
-        output.push(' ');
-        output.push_str(&doc_id.to_string());
-    }
-
-    output
+    out.push(b'\n');
 }
 
 #[cfg(test)]
@@ -280,46 +133,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn intersection_works() {
+    fn set_ops() {
+        let big: Vec<u32> = (0..1000).collect();
         assert_eq!(intersect(&[1, 2, 4], &[2, 3, 4]), vec![2, 4]);
-    }
-
-    #[test]
-    fn intersection_handles_skewed_lists() {
-        let small = vec![2, 100, 900];
-        let large: Vec<u32> = (0..1000).collect();
-        assert_eq!(intersect(&small, &large), small);
-        assert_eq!(intersect(&large, &[2, 100, 900]), small);
-    }
-
-    #[test]
-    fn union_works() {
+        assert_eq!(intersect(&big, &[2, 100, 900]), vec![2, 100, 900]);
         assert_eq!(union(&[1, 2, 4], &[2, 3, 4]), vec![1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn difference_works() {
         assert_eq!(difference(&[1, 2, 3, 4], &[2, 4]), vec![1, 3]);
-    }
-
-    #[test]
-    fn difference_with_empty_list() {
-        assert_eq!(difference(&[1, 2, 3], &[]), vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn difference_with_empty_left_list() {
-        assert_eq!(difference(&[], &[1, 2, 3]), Vec::<u32>::new());
-    }
-
-    #[test]
-    fn format_result_works() {
-        assert_eq!(format_result(&[1, 3, 5]), "3 9 1 3 5");
-    }
-
-    #[test]
-    fn format_result_limits_ids_to_ten() {
-        let ids: Vec<u32> = (0..15).collect();
-        assert_eq!(format_result(&ids), "15 105 0 1 2 3 4 5 6 7 8 9");
+        assert_eq!(difference(&[5, 2000], &big), vec![2000]);
+        assert_eq!(difference(&[], &[1]), Vec::<u32>::new());
     }
 }

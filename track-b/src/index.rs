@@ -1,193 +1,94 @@
-use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::thread;
 
-use crate::parser::Query;
+use crate::parser::TermMap;
 
-const MAX_TERM_LENGTH: usize = 32;
+const MAX_TERM: usize = 32;
 
-#[derive(Debug, Default)]
-pub struct TermPosting {
-    pub docs: Vec<u32>,
-    // One position list per document, only for phrase-query terms.
-    pub positions: Option<Vec<Vec<u32>>>,
+/// Index over a contiguous range of documents starting at `first`.
+pub struct Slice {
+    pub first: u32,
+    /// Every token of the slice as a query-term id (`NONE` if not a query
+    /// term); doc `first + i` is `toks[starts[i]..starts[i + 1]]`.
+    pub toks: Vec<u32>,
+    pub starts: Vec<u32>,
+    /// Sorted doc ids per query term.
+    pub post: Vec<Vec<u32>>,
 }
 
-#[derive(Debug)]
-pub struct InvertedIndex {
-    pub terms: Vec<Vec<u8>>,
-    pub postings: Vec<TermPosting>,
-    pub term_ids: HashMap<Vec<u8>, usize>,
-    pub document_count: u32,
-}
+pub const NONE: u32 = u32::MAX;
 
-pub fn collect_query_terms(
-    queries: &[Query],
-) -> (HashSet<Vec<u8>>, HashSet<Vec<u8>>) {
-    let mut all_terms = HashSet::new();
-    let mut phrase_terms = HashSet::new();
-
-    for query in queries {
-        match query {
-            Query::Bool { terms, .. } => {
-                for term in terms {
-                    all_terms.insert(term.clone());
-                }
-            }
-            Query::Phrase { terms } => {
-                for term in terms {
-                    all_terms.insert(term.clone());
-                    phrase_terms.insert(term.clone());
-                }
-            }
+// Byte -> lowercased token byte, or 0 for a separator.
+const LUT: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut b = 0;
+    while b < 256 {
+        let c = (b as u8).to_ascii_lowercase();
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            t[b] = c;
         }
+        b += 1;
     }
+    t
+};
 
-    (all_terms, phrase_terms)
-}
-
-pub fn build_index(
-    docs_path: &str,
-    queries: &[Query],
-) -> Result<InvertedIndex, String> {
-    let (all_terms, phrase_terms) = collect_query_terms(queries);
-    let terms: Vec<Vec<u8>> = all_terms.into_iter().collect();
-
-    let term_ids: HashMap<Vec<u8>, usize> = terms
-        .iter()
-        .enumerate()
-        .map(|(id, term)| (term.clone(), id))
-        .collect();
-
-    let mut postings: Vec<TermPosting> = terms
-        .iter()
-        .map(|term| TermPosting {
-            docs: Vec::new(),
-            positions: if phrase_terms.contains(term) {
-                Some(Vec::new())
-            } else {
-                None
-            },
-        })
-        .collect();
-
-    let file = File::open(docs_path)
-        .map_err(|e| format!("Cannot open documents: {e}"))?;
-
-    let mut reader = BufReader::new(file);
-    let mut line = Vec::with_capacity(4096);
-    let mut expected_id = 0u32;
-    let mut token_buffer = [0u8; MAX_TERM_LENGTH];
-
-    loop {
-        line.clear();
-
-        let bytes_read = reader
-            .read_until(b'\n', &mut line)
-            .map_err(|e| format!("Document read error: {e}"))?;
-
-        if bytes_read == 0 {
-            break;
+/// One slice per thread. Slices hold disjoint ascending doc ranges, so they
+/// are never merged: queries run per slice and concatenate.
+pub fn build(docs: &[u8], terms: &TermMap, threads: usize) -> Vec<Slice> {
+    let mut cuts = vec![0];
+    for t in 1..threads {
+        let mut p = (docs.len() * t / threads).max(*cuts.last().unwrap());
+        while p < docs.len() && docs[p - 1] != b'\n' {
+            p += 1;
         }
-
-        if line.last() == Some(&b'\n') {
-            line.pop();
-        }
-
-        let tab = line
-            .iter()
-            .position(|&b| b == b'\t')
-            .ok_or("Missing document TAB separator")?;
-
-        let doc_id: u32 = std::str::from_utf8(&line[..tab])
-            .map_err(|_| "Invalid document ID")?
-            .parse()
-            .map_err(|_| "Invalid document ID")?;
-
-        if doc_id != expected_id {
-            return Err(format!("Expected document {expected_id}, got {doc_id}"));
-        }
-
-        let text = &line[tab + 1..];
-        let mut position = 0u32;
-        let mut i = 0usize;
-
-        while i < text.len() {
-            if text[i].is_ascii_alphanumeric() {
-                let start = i;
-                i += 1;
-
-                while i < text.len() && text[i].is_ascii_alphanumeric() {
-                    i += 1;
-                }
-
-                let token = &text[start..i];
-                let token_len = token.len();
-
-                if token_len <= MAX_TERM_LENGTH {
-                    for (dst, &src) in
-                        token_buffer[..token_len].iter_mut().zip(token.iter())
-                    {
-                        *dst = src.to_ascii_lowercase();
-                    }
-
-                    if let Some(&term_id) =
-                        term_ids.get(&token_buffer[..token_len])
-                    {
-                        let posting = &mut postings[term_id];
-
-                        if posting.docs.last() != Some(&doc_id) {
-                            posting.docs.push(doc_id);
-
-                            if let Some(positions) = &mut posting.positions {
-                                positions.push(Vec::new());
-                            }
-                        }
-
-                        if let Some(positions) = &mut posting.positions {
-                            positions.last_mut().unwrap().push(position);
-                        }
-                    }
-                }
-
-                position += 1;
-            } else {
-                i += 1;
-            }
-        }
-
-        expected_id += 1;
+        cuts.push(p);
     }
-
-    Ok(InvertedIndex {
-        terms,
-        postings,
-        term_ids,
-        document_count: expected_id,
+    cuts.push(docs.len());
+    thread::scope(|s| {
+        let hs: Vec<_> = cuts.windows(2).map(|w| s.spawn(move || index_slice(&docs[w[0]..w[1]], terms))).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn collect_terms_from_queries() {
-        let queries = vec![
-            Query::Bool {
-                terms: vec![b"python".to_vec(), b"machine".to_vec()],
-                operators: vec![crate::parser::BoolOp::And],
-            },
-            Query::Phrase {
-                terms: vec![b"machine".to_vec(), b"learning".to_vec()],
-            },
-        ];
-
-        let (all, phrase) = collect_query_terms(&queries);
-
-        assert_eq!(all.len(), 3);
-        assert_eq!(phrase.len(), 2);
-        assert!(phrase.contains(b"machine".as_slice()));
-        assert!(phrase.contains(b"learning".as_slice()));
+fn index_slice(text: &[u8], terms: &TermMap) -> Slice {
+    let mut post: Vec<Vec<u32>> = vec![Vec::new(); terms.len()];
+    let mut toks = Vec::with_capacity(text.len() / 6);
+    let mut starts = vec![];
+    let mut first = None;
+    let mut add = |toks: &mut Vec<u32>, tok: &[u8], doc: u32| {
+        let id = terms.get(tok).map_or(NONE, |&id| id);
+        toks.push(id);
+        if id != NONE {
+            let p = &mut post[id as usize];
+            if p.last() != Some(&doc) {
+                p.push(doc);
+            }
+        }
+    };
+    for line in text.split(|&b| b == b'\n') {
+        let Some(tab) = line.iter().position(|&b| b == b'\t') else { continue };
+        let doc = line[..tab].iter().fold(0u32, |a, &b| a * 10 + (b - b'0') as u32);
+        first.get_or_insert(doc);
+        let body = &line[tab + 1..];
+        starts.push(toks.len() as u32);
+        let mut buf = [0u8; MAX_TERM];
+        let mut len = 0;
+        for &b in body {
+            let c = LUT[b as usize];
+            if c != 0 {
+                if len < MAX_TERM {
+                    buf[len] = c;
+                }
+                len += 1;
+            } else if len > 0 {
+                // Longer tokens can never equal a query term.
+                add(&mut toks, if len <= MAX_TERM { &buf[..len] } else { b"" }, doc);
+                len = 0;
+            }
+        }
+        if len > 0 {
+            add(&mut toks, if len <= MAX_TERM { &buf[..len] } else { b"" }, doc);
+        }
     }
+    starts.push(toks.len() as u32);
+    Slice { first: first.unwrap_or(0), toks, starts, post }
 }

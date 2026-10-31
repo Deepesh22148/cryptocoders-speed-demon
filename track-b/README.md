@@ -2,35 +2,32 @@
 
 ## Approach
 
-This submission builds an inverted index for the Track B document corpus and evaluates Boolean and phrase queries.
+- **Language:** Rust, standard library only (0 dependencies).
+- **Build:** `cargo build --release --offline`. The binary is `track-b-rust` and is copied to `/app/solution`.
+- **I/O:** reads `/data/queries.txt` and `/data/docs.txt`, and writes `/out/results.txt`. You can override the paths with `SPEED_DEMON_DATA_DIR` and `SPEED_DEMON_OUTPUT_DIR` for local runs.
 
-- **Language:** Rust
-- **Runtime dependencies:** None declared (standard library only; verify `Cargo.toml` before submission).
-- **Build:** `cargo build --release --offline`
-- **Executable:** `track-b-rust`
+The steps, in order:
 
-The implementation uses sorted document postings for Boolean operations. Phrase queries use token positions and a rare-term candidate anchor to reduce candidate checks.
-
-## Execution contract
-
-The competition runner mounts the input dataset read-only at `/data` and the output directory at `/out`. The program must read the Track B input files from `/data` and write exactly `/out/results.txt`, then exit successfully.
-
-**Important:** The current local development version used relative paths (`../data/b_full`). Before submitting, update `src/main.rs` to use `/data/docs.txt`, `/data/queries.txt`, and `/out/results.txt`, and verify it with the official harness. The Dockerfile does not rewrite those paths.
-
-## Build
-
-The Dockerfile uses the competition-published, digest-pinned Rust and Debian images and builds with Cargo offline. It expects the Cargo package/binary name to be `track-b-rust`. If your `[package].name` in `Cargo.toml` differs, change the binary path in the Dockerfile accordingly.
+1. **Parse queries first.** Each distinct term gets a `u32` id, and only those terms are indexed ([parser.rs](src/parser.rs)).
+2. **Index in parallel** ([index.rs](src/index.rs)).
+   - The corpus is cut into one line-aligned slice per hardware thread.
+   - Each thread tokenizes its slice with a 256-entry lookup table and finds each token's id in an Fx-hashed map.
+   - Each slice records two things:
+     - sorted doc ids for each term
+     - each document's token-id stream
+3. **Slices are never merged.** Each slice covers a disjoint, ascending range of doc ids. So a query runs on every slice, and the slice results are joined in order: counts and sums add up, and the first 10 ids come from the earliest slices.
+4. **Answer queries in parallel** ([query.rs](src/query.rs)). Threads pull blocks of 64 queries from an atomic counter.
+   - **BOOL:** strictly left to right. The first list is borrowed, not copied. Intersect and difference switch to binary search when one list is 8 or more times smaller than the other.
+   - **PHRASE:** intersect the term doc lists, rarest first. In each candidate doc's id stream, find the rarest term and compare the whole window around it.
 
 ## Verification
 
-The local full-dataset output was compared with the Python reference and the SHA-256 hashes matched:
-
-`F86973C210228141BCB6F1F1B10188AD2A9B65F71E7CD7CF4590B38DE4E80927`
-
-This local result does not replace a successful official Docker/harness run.
+- Checked against the reference `b_index.py` on synthetic data built from the spec: identical output.
+- The output is also identical to the previous Rust version, whose real-data sha256 matched the reference (`F86973C2...`).
+- Details are in [PERF.md](PERF.md).
 
 ## If I had another 24 hours
 
-1. Run the official harness repeatedly and retain live-board run IDs.
-2. Profile the scoring-machine workload before making further algorithm changes.
-3. Re-check peak memory, startup overhead, and deterministic output under the read-only sandbox.
+1. Push, record the board run IDs, and check the real full dataset against its published hash.
+2. Profile on Linux with 12 threads, and check where index and query time go there.
+3. If phrases with no anchor show up as hot, add positions for the few very common terms only.

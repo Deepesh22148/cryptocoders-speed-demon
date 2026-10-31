@@ -1,107 +1,76 @@
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BoolOp {
+// Fx-style hasher: terms are short ASCII, SipHash is overkill.
+#[derive(Default)]
+pub struct Fx(u64);
+
+impl Hasher for Fx {
+    fn write(&mut self, bytes: &[u8]) {
+        for c in bytes.chunks(8) {
+            let mut w = [0u8; 8];
+            w[..c.len()].copy_from_slice(c);
+            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(w)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+pub type TermMap<'a> = HashMap<&'a [u8], u32, BuildHasherDefault<Fx>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
     And,
     Or,
     Not,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Query {
-    Bool {
-        terms: Vec<Vec<u8>>,
-        operators: Vec<BoolOp>,
-    },
-    Phrase {
-        terms: Vec<Vec<u8>>,
-    },
+    Bool { terms: Vec<u32>, ops: Vec<Op> },
+    Phrase(Vec<u32>),
 }
 
-fn is_valid_term(term: &[u8]) -> bool {
-    !term.is_empty()
-        && term.len() <= 32
-        && term.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+/// Parsed queries with every term interned to an id.
+pub struct Parsed<'a> {
+    pub queries: Vec<Query>,
+    pub terms: TermMap<'a>,
 }
 
-fn parse_operator(op: &[u8]) -> Option<BoolOp> {
-    match op {
-        b"AND" => Some(BoolOp::And),
-        b"OR" => Some(BoolOp::Or),
-        b"NOT" => Some(BoolOp::Not),
-        _ => None,
-    }
-}
-
-pub fn parse_query(line: &[u8]) -> Result<Query, &'static str> {
-    if line.starts_with(b"BOOL ") {
-        return parse_bool(&line[5..]);
-    }
-
-    if line.starts_with(b"PHRASE ") {
-        return parse_phrase(&line[7..]);
-    }
-
-    Err("Unknown query type")
-}
-
-fn parse_bool(input: &[u8]) -> Result<Query, &'static str> {
-    let parts: Vec<&[u8]> = input.split(|&b| b == b' ').collect();
-
-    if parts.is_empty() || parts.len() % 2 == 0 {
-        return Err("Invalid boolean query structure");
-    }
-
-    let term_count = (parts.len() + 1) / 2;
-
-    if !(1..=6).contains(&term_count) {
-        return Err("Boolean query must contain 1 to 6 terms");
-    }
-
-    let mut terms = Vec::with_capacity(term_count);
-    let mut operators = Vec::with_capacity(term_count - 1);
-
-    for i in 0..parts.len() {
-        if i % 2 == 0 {
-            if !is_valid_term(parts[i]) {
-                return Err("Invalid boolean term");
+pub fn parse(input: &[u8]) -> Parsed<'_> {
+    let mut p = Parsed { queries: Vec::new(), terms: TermMap::default() };
+    for line in input.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+        let q = if let Some(rest) = line.strip_prefix(b"BOOL ") {
+            let mut terms = Vec::new();
+            let mut ops = Vec::new();
+            for (i, w) in rest.split(|&b| b == b' ').enumerate() {
+                if i % 2 == 0 {
+                    terms.push(intern(&mut p, w));
+                } else {
+                    ops.push(match w {
+                        b"AND" => Op::And,
+                        b"OR" => Op::Or,
+                        b"NOT" => Op::Not,
+                        _ => panic!("bad operator in {:?}", String::from_utf8_lossy(line)),
+                    });
+                }
             }
-
-            terms.push(parts[i].to_vec());
+            Query::Bool { terms, ops }
+        } else if let Some(rest) = line.strip_prefix(b"PHRASE \"").and_then(|r| r.strip_suffix(b"\"")) {
+            Query::Phrase(rest.split(|&b| b == b' ').map(|w| intern(&mut p, w)).collect())
         } else {
-            let op = parse_operator(parts[i])
-                .ok_or("Invalid boolean operator")?;
-
-            operators.push(op);
-        }
+            panic!("bad query {:?}", String::from_utf8_lossy(line));
+        };
+        p.queries.push(q);
     }
-
-    Ok(Query::Bool { terms, operators })
+    p
 }
 
-fn parse_phrase(input: &[u8]) -> Result<Query, &'static str> {
-    if input.len() < 5 || !input.starts_with(b"\"") || !input.ends_with(b"\"") {
-        return Err("Invalid phrase format");
-    }
-
-    let content = &input[1..input.len() - 1];
-
-    let parts: Vec<&[u8]> = content.split(|&b| b == b' ').collect();
-
-    if !(2..=8).contains(&parts.len()) {
-        return Err("Phrase must contain 2 to 8 terms");
-    }
-
-    let mut terms = Vec::with_capacity(parts.len());
-
-    for term in parts {
-        if !is_valid_term(term) {
-            return Err("Invalid phrase term");
-        }
-
-        terms.push(term.to_vec());
-    }
-
-    Ok(Query::Phrase { terms })
+fn intern<'a>(p: &mut Parsed<'a>, term: &'a [u8]) -> u32 {
+    let next = p.terms.len() as u32;
+    *p.terms.entry(term).or_insert(next)
 }
 
 #[cfg(test)]
@@ -109,75 +78,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_single_term_bool() {
-        let query = parse_query(b"BOOL python").unwrap();
-
-        assert_eq!(
-            query,
-            Query::Bool {
-                terms: vec![b"python".to_vec()],
-                operators: vec![],
-            }
-        );
-    }
-
-    #[test]
-    fn parse_multiple_bool_terms() {
-        let query = parse_query(b"BOOL python AND machine OR learning").unwrap();
-
-        assert_eq!(
-            query,
-            Query::Bool {
-                terms: vec![
-                    b"python".to_vec(),
-                    b"machine".to_vec(),
-                    b"learning".to_vec(),
-                ],
-                operators: vec![BoolOp::And, BoolOp::Or],
-            }
-        );
-    }
-
-    #[test]
-    fn preserve_left_to_right_operator_order() {
-        let query = parse_query(b"BOOL a OR b AND c").unwrap();
-
-        match query {
-            Query::Bool { operators, .. } => {
-                assert_eq!(operators, vec![BoolOp::Or, BoolOp::And]);
-            }
-            _ => panic!("Expected boolean query"),
-        }
-    }
-
-    #[test]
-    fn parse_phrase() {
-        let query = parse_query(b"PHRASE \"writ of habeas corpus\"").unwrap();
-
-        assert_eq!(
-            query,
-            Query::Phrase {
-                terms: vec![
-                    b"writ".to_vec(),
-                    b"of".to_vec(),
-                    b"habeas".to_vec(),
-                    b"corpus".to_vec(),
-                ]
-            }
-        );
-    }
-
-    #[test]
-    fn reject_invalid_queries() {
-        assert!(parse_query(b"BOOL python XOR machine").is_err());
-        assert!(parse_query(b"BOOL python AND").is_err());
-        assert!(parse_query(b"BOOL Python").is_err());
-        assert!(parse_query(b"PHRASE \"python\"").is_err());
-        assert!(parse_query(b"PHRASE \"python  machine\"").is_err());
-    }
-
-    #[test]
-    fn reject_empty_boolean_terms() {
-        assert!(parse_query(b"BOOL python  AND machine").is_err());
+    fn parses_and_interns() {
+        let p = parse(b"BOOL a OR b AND a\nPHRASE \"b c\"\n");
+        assert_eq!(p.queries[0], Query::Bool { terms: vec![0, 1, 0], ops: vec![Op::Or, Op::And] });
+        assert_eq!(p.queries[1], Query::Phrase(vec![1, 2]));
     }
 }

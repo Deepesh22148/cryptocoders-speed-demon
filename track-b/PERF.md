@@ -1,38 +1,32 @@
 # Track B — Performance Log
 
-This log distinguishes local measurements from official live-board measurements. Add the official run ID for every experiment after pushing it to the Speed Demon board.
+Local numbers are from a Windows laptop (8 hardware threads). The board has 12 threads and runs Linux, so these numbers are only for comparing one version with another. Add the official run ID for every step once it is pushed.
 
-## Baseline
+## Test data
 
-- Implementation: initial Rust Track B implementation.
-- Local full dataset: 250,000 documents and 50,000 queries.
-- Previously recorded local end-to-end runtime: approximately **60.57 s**.
-- Correctness: the baseline output SHA-256 matched the Python reference.
+The generator in the organisers' repo was not run locally. Instead, a synthetic generator built from `specs/b-index.md` produced 250,000 docs (255 MB) and 50,000 queries. It follows the spec's Zipf vocabulary, document-length buckets, separators, non-ASCII words, caps and repeated runs. Query terms follow the spec's df bands. Its BOOL answer counts are median 1, p90 1.2k and p99 59k; the spec reports 8, 2.6k and 80k.
 
-## Optimized implementation
+How correctness was checked:
 
-Changes include:
-- Adaptive intersection and difference strategies for skewed posting-list sizes.
-- Rarest-term anchoring for phrase-query candidate documents.
-- Stack-backed storage for phrase position slices during candidate evaluation.
+- On a 20k-doc set, the output is byte-identical to the reference `b_index.py`.
+- On every full-size set, the output is identical to the previous Rust version, which had already matched the reference sha256 on the real data (`F86973C2...`).
 
-Previously recorded local full-dataset runtime: approximately **14.18 s**.
+## Steps
 
-- Approximate local speedup versus the earlier Rust baseline: **4.27×**.
-- Full-output SHA-256: `F86973C210228141BCB6F1F1B10188AD2A9B65F71E7CD7CF4590B38DE4E80927`
-- Python reference SHA-256: `F86973C210228141BCB6F1F1B10188AD2A9B65F71E7CD7CF4590B38DE4E80927`
-- Correctness: byte-for-byte output hash match confirmed locally.
+| # | Change | Local wall time | Official run ID |
+|---|---|---:|---|
+| 0 | Initial Rust | ~60.6 s (real data) | — |
+| 1 | Adaptive intersect/difference, rarest-anchor phrases | ~14.2 s (real data); 42 s on synthetic | Pending |
+| 2 | Whole-file reads, Fx hash, query terms interned to ids, parallel indexing over line-aligned slices, parallel query blocks, LTO | 7.5 s | Pending |
+| 3 | Slices are never merged: each owns a disjoint ascending doc range, so every answer is the concatenation of per-slice answers (the merge cost ~1 s) | 2.5 s | Pending |
+| 4 | Positional postings removed: each doc stores its token-id stream (sequential pushes), and phrases intersect doc lists then match the id window around the rarest term | 2.2 s | Pending |
 
-## Official benchmark runs
+Phase split after step 4: read ~0.15 s, index ~0.9 s, queries ~0.9 s.
 
-| Version / change | Local runtime | Official run ID | Official result |
-|---|---:|---|---|
-| Initial Rust implementation | ~60.57 s | Pending | Pending |
-| Adaptive posting-list operations + rarest-anchor phrase search | ~14.18 s | Pending | Pending |
+## Tried and reverted
 
-## Notes and limitations
+- **Re-scanning document text to check phrases.** Indexing got faster, but about 400 phrases made only of common words had huge candidate sets. That meant 10.9 GB of text re-lexed and the query phase took ~10 s. The token-id streams of step 4 replaced it.
 
-- The runtimes above are local measurements, not competition scoring measurements.
-- No official live-board run IDs are available yet; do not invent or backfill run IDs.
-- The Docker execution contract and official harness still need to be tested.
-- Record unsuccessful experiments here too, including the reason each was reverted.
+## Known ceiling
+
+A phrase with no rare term (for example `"the the"`) scans the id stream of every doc that holds all of its terms. Adding 192 such phrases cost about +1.3 s locally. The spec has about 92 phrases with no anchor. If they turn out to dominate, add positions for very common terms only.
