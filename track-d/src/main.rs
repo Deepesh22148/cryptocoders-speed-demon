@@ -1,17 +1,18 @@
 use std::cmp::{max, min};
 use std::fs::File;
-use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::Relaxed};
+use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
-const SH: usize = 15;
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+}
 
-#[derive(Clone, Copy)]
-struct Edge { to: u32, w: u32 }
 #[derive(Clone, Copy)]
 struct Ent { k: u64, v: u32 }
 
-// Raw pointer that may be shared across threads; callers guarantee disjoint writes.
+// Raw pointer shared across threads; callers guarantee disjoint writes.
 struct P<T>(*mut T);
 impl<T> Clone for P<T> { fn clone(&self) -> Self { *self } }
 impl<T> Copy for P<T> {}
@@ -20,9 +21,6 @@ unsafe impl<T> Sync for P<T> {}
 impl<T> P<T> {
     #[inline(always)] fn at(self, i: usize) -> *mut T { unsafe { self.0.add(i) } }
     #[inline(always)] unsafe fn set(self, i: usize, v: T) { std::ptr::write(self.0.add(i), v) }
-}
-impl<T: Copy> P<T> {
-    #[inline(always)] unsafe fn get(self, i: usize) -> T { *self.0.add(i) }
 }
 
 #[inline(always)]
@@ -47,11 +45,38 @@ fn dynp(nt: usize, n: usize, f: impl Fn(usize) + Sync) {
     });
 }
 
-fn num(b: &[u8], p: &mut usize, e: usize) -> u64 {
-    while *p < e && !b[*p].is_ascii_digit() { *p += 1; }
+fn atomic_view(v: &mut [u32]) -> &[AtomicU32] {
+    unsafe { &*(v as *mut [u32] as *const [AtomicU32]) }
+}
+
+// Drop the pages fully inside edge range [lo, hi) of the u64 array at `base`.
+fn release(base: usize, lo: usize, hi: usize) {
+    let a = (base + lo * 8 + 4095) & !4095;
+    let b = (base + hi * 8) & !4095;
+    if b > a { unsafe { madvise(a as *mut u8, b - a, 4); } } // 4 = MADV_DONTNEED
+}
+
+// Reads the next unsigned number; leaves p on the byte after it.
+fn rd(b: &[u8], p: &mut usize) -> u64 {
+    let n = b.len();
+    let mut i = *p;
+    while i < n && !b[i].is_ascii_digit() { i += 1; }
     let mut x = 0u64;
-    while *p < e && b[*p].is_ascii_digit() { x = x * 10 + (b[*p] - b'0') as u64; *p += 1; }
+    while i < n && b[i].is_ascii_digit() { x = x * 10 + (b[i] - b'0') as u64; i += 1; }
+    *p = i;
     x
+}
+
+// Lines "u v w\n" in [s, e); s and e are line starts.
+fn scan(b: &[u8], s: usize, e: usize, mut f: impl FnMut(u32, u32, u32)) {
+    let mut p = s;
+    while p < e {
+        let u = rd(b, &mut p);
+        let v = rd(b, &mut p);
+        let w = rd(b, &mut p);
+        p += 1; // the '\n'
+        f(u as u32, v as u32, w as u32);
+    }
 }
 
 // 4-ary min-heap, lazy deletion
@@ -86,92 +111,58 @@ impl Heap {
     }
 }
 
-struct G { off: [Vec<u32>; 2], adj: [Vec<Edge>; 2] }
+// label = dist+1, 0 = unlabeled; t = touched nodes, reset after each query
+struct Sc { l: Vec<u64>, t: Vec<u32>, h: Heap }
 
-// label = dist+1, 0 = unlabeled
-struct Sc { l: [Vec<u64>; 2], t: [Vec<u32>; 2], h: [Heap; 2] }
-
-fn solve(g: &G, s: &mut Sc, src: u32, dst: u32) -> i64 {
-    if src == dst { return 0; }
-    if g.off[0][src as usize] == g.off[0][src as usize + 1]
-        || g.off[1][dst as usize] == g.off[1][dst as usize + 1] { return -1; }
-    let mut mu = u64::MAX;
-    let st = [src, dst];
-    for d in 0..2 {
-        s.h[d].a.clear();
-        s.l[d][st[d] as usize] = 1;
-        s.t[d].push(st[d]);
-        s.h[d].push(Ent { k: 0, v: st[d] });
-    }
-    while !s.h[0].a.is_empty() && !s.h[1].a.is_empty() && s.h[0].a[0].k + s.h[1].a[0].k < mu {
-        let d = if s.h[0].a.len() <= s.h[1].a.len() { 0 } else { 1 };
-        let e = s.h[d].a[0];
-        s.h[d].pop();
-        let me = s.l[d].as_mut_ptr();
-        let ot = s.l[1 - d].as_ptr();
-        let a = &g.adj[d];
-        let i0 = g.off[d][e.v as usize] as usize;
-        let i1 = g.off[d][e.v as usize + 1] as usize;
+fn solve(off: &[u32], adj: &[u64], s: &mut Sc, src: u32, dst: u32) -> i64 {
+    let l = s.l.as_mut_ptr();
+    s.h.a.clear();
+    s.t.clear();
+    unsafe { *l.add(src as usize) = 1; }
+    s.t.push(src);
+    s.h.push(Ent { k: 0, v: src });
+    let mut res = -1i64;
+    while let Some(&e) = s.h.a.first() {
+        s.h.pop();
+        let v = e.v as usize;
         unsafe {
-            for i in i0..i1 { pf(me.add(a[i].to as usize)); pf(ot.add(a[i].to as usize)); }
+            if *l.add(v) != e.k + 1 { continue; } // stale entry
+            if e.v == dst { res = e.k as i64; break; }
+            let i0 = *off.get_unchecked(v) as usize;
+            let i1 = *off.get_unchecked(v + 1) as usize;
+            for i in i0..i1 { pf(l.add(*adj.get_unchecked(i) as u32 as usize)); }
             for i in i0..i1 {
-                let v = a[i].to as usize;
-                let nd = e.k + a[i].w as u64;
-                let c = nd + 1;
-                let cur = *me.add(v);
-                if cur == 0 || c < cur {
-                    if cur == 0 { s.t[d].push(v as u32); }
-                    *me.add(v) = c;
-                    s.h[d].push(Ent { k: nd, v: v as u32 });
+                let x = *adj.get_unchecked(i);
+                let to = x as u32 as usize;
+                let nd = e.k + (x >> 32);
+                let cur = *l.add(to);
+                if cur == 0 || nd + 1 < cur {
+                    if cur == 0 { s.t.push(to as u32); }
+                    *l.add(to) = nd + 1;
+                    s.h.push(Ent { k: nd, v: to as u32 });
                 }
-                let ov = *ot.add(v);
-                if ov != 0 { mu = mu.min(nd + ov - 1); }
-            }
-            // keep the top valid
-            loop {
-                let (k, v) = match s.h[d].a.first() { Some(x) => (x.k, x.v), None => break };
-                if *me.add(v as usize) < k + 1 { s.h[d].pop(); } else { break; }
             }
         }
     }
-    for d in 0..2 {
-        for &v in &s.t[d] { s.l[d][v as usize] = 0; }
-        s.t[d].clear();
-    }
-    if mu == u64::MAX { -1 } else { mu as i64 }
-}
-
-#[inline(always)]
-fn each<F: FnMut([u32; 3])>(d: usize, k: usize, parts: &[Vec<[u32; 3]>], off0: &[u32], adj0: &[Edge],
-                            bk: usize, n: usize, mut f: F) {
-    if d == 0 {
-        for &e in &parts[k] { f(e); }
-    } else {
-        for u in k * bk..min(n, (k + 1) * bk) {
-            for i in off0[u] as usize..off0[u + 1] as usize {
-                f([u as u32, adj0[i].to, adj0[i].w]);
-            }
-        }
-    }
+    for &v in &s.t { unsafe { *l.add(v as usize) = 0; } }
+    s.t.clear();
+    res
 }
 
 fn claim(vis: &[AtomicU8], v: usize) -> bool {
     vis[v].load(Relaxed) == 0 && vis[v].swap(1, Relaxed) == 0
 }
 
-fn grow(q: &mut Vec<u32>, off: &[Vec<u32>; 2], adj: &[Vec<Edge>; 2], vis: &[AtomicU8]) {
+// BFS over out-edges from the nodes already in q, appending newly claimed nodes.
+fn grow(q: &mut Vec<u32>, off: &[u32], adj: &[u64], vis: &[AtomicU8]) {
     let mut h = 0;
     while h < q.len() {
         let u = q[h] as usize;
-        if h + 16 < q.len() { for d in 0..2 { pf(off[d].as_ptr().wrapping_add(q[h + 16] as usize)); } }
-        if h + 8 < q.len() {
-            for d in 0..2 { pf(adj[d].as_ptr().wrapping_add(off[d][q[h + 8] as usize] as usize)); }
-        }
-        for d in 0..2 {
-            for i in off[d][u] as usize..off[d][u + 1] as usize {
-                let v = adj[d][i].to;
-                if claim(vis, v as usize) { q.push(v); }
-            }
+        if h + 16 < q.len() { pf(off.as_ptr().wrapping_add(q[h + 16] as usize)); }
+        if h + 8 < q.len() { pf(adj.as_ptr().wrapping_add(off[q[h + 8] as usize] as usize)); }
+        for i in off[u] as usize..off[u + 1] as usize {
+            let v = adj[i] as u32;
+            if claim(vis, v as usize) { q.push(v); }
         }
         h += 1;
     }
@@ -180,226 +171,216 @@ fn grow(q: &mut Vec<u32>, off: &[Vec<u32>; 2], adj: &[Vec<Edge>; 2], vis: &[Atom
 fn main() {
     let nt = thread::available_parallelism().map(|x| x.get()).unwrap_or(12).min(12);
 
-    // ---- parse: ~1 MB chunks, each read by whichever thread is free, aligned to line starts ----
+    // ---- map the input ----
     let f = File::open("/data/graph.txt").unwrap();
     let fz = f.metadata().unwrap().len() as usize;
-    let nc = max(nt, fz >> 20);
-    let mut parts: Vec<Vec<[u32; 3]>> = (0..nc).map(|_| Vec::new()).collect();
-    let np = AtomicUsize::new(0);
+    let b: &'static [u8] = unsafe {
+        let p = mmap(std::ptr::null_mut(), fz, 1 /*PROT_READ*/, 2 /*MAP_PRIVATE*/, f.as_raw_fd(), 0);
+        if p as usize == usize::MAX {
+            let r: &'static [u8] = Box::leak(std::fs::read("/data/graph.txt").unwrap().into_boxed_slice());
+            r
+        } else {
+            std::slice::from_raw_parts(p as *const u8, fz)
+        }
+    };
+    let mut hp = 0usize;
+    let n = rd(b, &mut hp) as usize;
+    let body = { let mut i = hp; while i < fz && b[i] != b'\n' { i += 1; } min(i + 1, fz) };
+    let nc = max(nt * 2, max(1, fz >> 20));
+    let span = fz - body;
+    let ls = |x: usize| -> usize {
+        if x <= body { return body; }
+        if x >= fz { return fz; }
+        let mut i = x;
+        if b[i - 1] != b'\n' {
+            while i < fz && b[i] != b'\n' { i += 1; }
+            i = min(i + 1, fz);
+        }
+        i
+    };
+    let range = |k: usize| (ls(body + span * k / nc), ls(body + span * (k + 1) / nc));
+
+    // ---- pass 1: out-degrees, and a bit per node that has an in-edge ----
+    let mut off = vec![0u32; n + 1];
+    let hin: Vec<AtomicU64> = (0..(n >> 6) + 1).map(|_| AtomicU64::new(0)).collect();
     {
-        let pp = P(parts.as_mut_ptr());
+        let deg = atomic_view(&mut off);
+        let hin = &hin;
         dynp(nt, nc, |k| {
-            let r0 = fz / nc * k;
-            let r1 = if k + 1 == nc { fz } else { fz / nc * (k + 1) };
-            let s = if k > 0 { r0 - 1 } else { 0 };
-            let e = if k + 1 == nc { fz } else { min(fz, r1 + 256) };
-            let mut b = vec![0u8; e - s];
-            let mut o = 0;
-            while o < b.len() {
-                match f.read_at(&mut b[o..], (s + o) as u64) { Ok(0) | Err(_) => break, Ok(r) => o += r }
-            }
-            let q = b.len();
-            let nxt = |mut x: usize| { while x < q && b[x] != b'\n' { x += 1; } if x < q { x + 1 } else { q } };
-            if k == 0 { let mut h = 0; np.store(num(&b, &mut h, q) as usize, Relaxed); }
-            let mut a = nxt(0);
-            let z = if k + 1 == nc { q } else { nxt(r1 - 1 - s) };
-            let v = unsafe { &mut *pp.at(k) };
-            v.reserve((z.saturating_sub(a)) / 12 + 16);
-            loop {
-                while a < z && !b[a].is_ascii_digit() { a += 1; }
-                if a >= z { break; }
-                let u = num(&b, &mut a, z);
-                let w1 = num(&b, &mut a, z);
-                let w = num(&b, &mut a, z);
-                if u != w1 { v.push([u as u32, w1 as u32, w as u32]); }
-            }
+            let (s, e) = range(k);
+            scan(b, s, e, |u, v, _| {
+                if u != v {
+                    deg[u as usize].fetch_add(1, Relaxed);
+                    let w = &hin[(v >> 6) as usize];
+                    let bit = 1u64 << (v & 63);
+                    if w.load(Relaxed) & bit == 0 { w.fetch_or(bit, Relaxed); }
+                }
+            });
         });
     }
-    let n = np.load(Relaxed);
+    let mut r = 0u32;
+    for u in 0..n { r += off[u]; off[u] = r; } // inclusive prefix = end of each node's slice
+    off[n] = r;
+    let e_ = r as usize;
 
-    // ---- CSR build: d=0 forward (keyed by u), d=1 reverse (keyed by v) from the forward CSR ----
-    let b_ = (n >> SH) + 1;
-    let bk = (n + nc - 1) / nc;
-    let mut off: [Vec<u32>; 2] = [Vec::new(), Vec::new()];
-    let mut adj: [Vec<Edge>; 2] = [Vec::new(), Vec::new()];
-    let mut c = vec![0usize; nc * b_];
-    let mut bs = vec![0usize; b_ + 1];
-    let mut e_ = 0usize;
-    for d in 0..2 {
-        c.fill(0);
-        {
-            let cp = P(c.as_mut_ptr());
-            dynp(nt, nc, |k| {
-                each(d, k, &parts, &off[0], &adj[0], bk, n, |e| unsafe {
-                    *cp.at(k * b_ + (e[d] >> SH) as usize) += 1;
-                });
-            });
-        }
-        let mut r = 0usize;
-        for b in 0..b_ {
-            bs[b] = r;
-            for k in 0..nc { let cc = c[k * b_ + b]; c[k * b_ + b] = r; r += cc; }
-        }
-        bs[b_] = r;
-        e_ = r;
-        // tmp is fully written below before being read
-        let mut tmp: Vec<[u32; 3]> = Vec::with_capacity(e_ + 1);
-        unsafe { tmp.set_len(e_ + 1); }
-        {
-            let cp = P(c.as_mut_ptr());
-            let t = P(tmp.as_mut_ptr());
-            dynp(nt, nc, |k| {
-                each(d, k, &parts, &off[0], &adj[0], bk, n, |e| unsafe {
-                    let slot = cp.at(k * b_ + (e[d] >> SH) as usize);
-                    let pos = *slot;
-                    *slot += 1;
-                    t.set(pos, e);
-                });
-            });
-        }
-        if d == 0 { parts.clear(); parts.shrink_to_fit(); }
-        let mut offd = vec![0u32; n + 1];
-        offd[n] = e_ as u32;
-        let mut adjd: Vec<Edge> = Vec::with_capacity(e_ + 1);
-        unsafe { adjd.set_len(e_ + 1); }
-        {
-            let op = P(offd.as_mut_ptr());
-            let ap = P(adjd.as_mut_ptr());
-            let t = P(tmp.as_mut_ptr());
-            let bs = &bs;
-            dynp(nt, b_, |b| unsafe {
-                let lo = b << SH;
-                let hi = min(n, (b + 1) << SH);
-                let (i0, i1) = (bs[b], bs[b + 1]);
-                let mut cnt = vec![0u32; hi.saturating_sub(lo)];
-                for i in i0..i1 { cnt[t.get(i)[d] as usize - lo] += 1; }
-                let mut r = i0 as u32;
-                for j in 0..cnt.len() { let x = cnt[j]; op.set(lo + j, r); cnt[j] = r; r += x; }
-                for i in i0..i1 {
-                    let e = t.get(i);
-                    let slot = &mut cnt[e[d] as usize - lo];
-                    ap.set(*slot as usize, Edge { to: e[1 - d], w: e[2] });
-                    *slot += 1;
-                }
-            });
-        }
-        drop(tmp);
-        off[d] = offd;
-        adj[d] = adjd;
-    }
-
-    // ---- renumber nodes in BFS order (parallel region growing) if ids look scattered ----
-    let mut nid: Vec<u32> = Vec::new();
+    // ---- pass 2: place every edge in its final slot; off[u] ends up as the start ----
+    let mut adj = vec![0u64; e_];
     {
-        let (mut nr, mut tot) = (0u64, 0u64);
-        let sd = max(1, n / 200000);
-        let mut u = 0;
-        while u < n {
-            for i in off[0][u] as usize..off[0][u + 1] as usize {
-                let v = adj[0][i].to as usize;
-                tot += 1;
-                nr += ((if u > v { u - v } else { v - u }) <= 4096) as u64;
-            }
-            u += sd;
-        }
-        if tot > 0 && nr * 10 < tot * 6 && n > 1 {
-            let vis: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(0)).collect();
-            let mut lists: Vec<Vec<u32>> = (0..=nt).map(|_| Vec::new()).collect();
-            {
-                let lp = P(lists.as_mut_ptr());
-                let (offr, adjr, visr) = (&off, &adj, &vis[..]);
-                par(nt, |k| {
-                    let q = unsafe { &mut *lp.at(k) };
-                    q.reserve(n / nt * 3 / 2 + 1024);
-                    let s = (n as u64 * k as u64 / nt as u64) as usize;
-                    if claim(visr, s) { q.push(s as u32); grow(q, offr, adjr, visr); }
-                });
-            }
-            for r in 0..n {
-                if claim(&vis, r) {
-                    lists[nt].push(r as u32);
-                    grow(&mut lists[nt], &off, &adj, &vis);
+        let deg = atomic_view(&mut off);
+        let ap = P(adj.as_mut_ptr());
+        dynp(nt, nc, |k| {
+            let (s, e) = range(k);
+            scan(b, s, e, |u, v, w| {
+                if u != v {
+                    let pos = deg[u as usize].fetch_sub(1, Relaxed) - 1;
+                    unsafe { ap.set(pos as usize, (v as u64) | ((w as u64) << 32)); }
                 }
-            }
-            let mut ord: Vec<u32> = Vec::with_capacity(n);
-            for q in &lists { ord.extend_from_slice(q); }
-            drop(lists);
-            let bt = (n + nt - 1) / nt;
-            nid = vec![0u32; n];
-            {
-                let np_ = P(nid.as_mut_ptr());
-                let ord = &ord;
-                par(nt, |k| { for i in k * bt..min(n, (k + 1) * bt) { unsafe { np_.set(ord[i] as usize, i as u32); } } });
-            }
-            for d in 0..2 {
-                let mut no = vec![0u32; n + 1];
-                {
-                    let nop = P(no.as_mut_ptr());
-                    let (o, ord) = (&off[d], &ord);
-                    par(nt, |k| for i in k * bt..min(n, (k + 1) * bt) {
-                        unsafe { nop.set(i + 1, o[ord[i] as usize + 1] - o[ord[i] as usize]); }
-                    });
-                }
-                for i in 0..n { no[i + 1] += no[i]; }
-                let mut na: Vec<Edge> = Vec::with_capacity(e_ + 1);
-                unsafe { na.set_len(e_ + 1); }
-                {
-                    let nap = P(na.as_mut_ptr());
-                    let (o, a, ord, nidr, no) = (&off[d], &adj[d], &ord, &nid, &no);
-                    par(nt, |k| for i in k * bt..min(n, (k + 1) * bt) {
-                        let mut w = no[i] as usize;
-                        let oo = ord[i] as usize;
-                        for j in o[oo] as usize..o[oo + 1] as usize {
-                            unsafe { nap.set(w, Edge { to: nidr[a[j].to as usize], w: a[j].w }); }
-                            w += 1;
-                        }
-                    });
-                }
-                off[d] = no;
-                adj[d] = na;
-            }
-        }
+            });
+        });
     }
-    let g = G { off, adj };
 
-    // ---- queries ----
+    // ---- queries: answer the trivial ones now, in the original id space ----
     let mut qs: Vec<(u32, u32)> = Vec::new();
     {
-        let b = std::fs::read("/data/queries.txt").unwrap();
-        let (mut p, e) = (0usize, b.len());
+        let qb = std::fs::read("/data/queries.txt").unwrap();
+        let (mut p, e) = (0usize, qb.len());
         loop {
-            while p < e && !b[p].is_ascii_digit() { p += 1; }
+            while p < e && !qb[p].is_ascii_digit() { p += 1; }
             if p >= e { break; }
-            let mut s = num(&b, &mut p, e) as u32;
-            let mut t = num(&b, &mut p, e) as u32;
-            if !nid.is_empty() { s = nid[s as usize]; t = nid[t as usize]; }
+            let s = rd(&qb, &mut p) as u32;
+            let t = rd(&qb, &mut p) as u32;
             qs.push((s, t));
         }
     }
     let nq = qs.len();
-    let mut od: Vec<u32> = (0..nq as u32).collect();
-    od.sort_unstable_by_key(|&i| qs[i as usize].0);
-    drop(nid);
     let mut ans = vec![0i64; nq];
+    let mut pend: Vec<u32> = Vec::new();
+    for (i, &(s, t)) in qs.iter().enumerate() {
+        let no_out = off[s as usize] == off[s as usize + 1];
+        let no_in = ((hin[(t >> 6) as usize].load(Relaxed) >> (t & 63)) & 1) == 0;
+        if s == t { ans[i] = 0; }
+        else if no_out || no_in { ans[i] = -1; }
+        else { pend.push(i as u32); }
+    }
+    drop(hin);
+
+    // ---- renumber nodes in BFS order if ids look scattered ----
+    let mut nid: Vec<u32> = Vec::new();
+    let (mut nr, mut tot) = (0u64, 0u64);
+    {
+        let sd = max(1, n / 200000);
+        let mut u = 0;
+        while u < n {
+            for i in off[u] as usize..off[u + 1] as usize {
+                let v = adj[i] as u32 as usize;
+                tot += 1;
+                nr += (u.abs_diff(v) <= 4096) as u64;
+            }
+            u += sd;
+        }
+    }
+    if tot > 0 && nr * 10 < tot * 6 && n > 1 {
+        let vis: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(0)).collect();
+        let mut lists: Vec<Vec<u32>> = (0..=nt).map(|_| Vec::new()).collect();
+        {
+            let lp = P(lists.as_mut_ptr());
+            let (offr, adjr, visr) = (&off[..], &adj[..], &vis[..]);
+            par(nt, |k| {
+                let q = unsafe { &mut *lp.at(k) };
+                q.reserve(n / nt * 3 / 2 + 1024);
+                let s = (n as u64 * k as u64 / nt as u64) as usize;
+                if claim(visr, s) { q.push(s as u32); grow(q, offr, adjr, visr); }
+            });
+        }
+        for r in 0..n {
+            if claim(&vis, r) {
+                lists[nt].push(r as u32);
+                grow(&mut lists[nt], &off, &adj, &vis);
+            }
+        }
+        let mut base = vec![0usize; nt + 2];
+        for k in 0..=nt { base[k + 1] = base[k] + lists[k].len(); }
+        nid = vec![0u32; n];
+        {
+            let np_ = P(nid.as_mut_ptr());
+            let (lr, br) = (&lists, &base);
+            par(nt + 1, |k| {
+                for (j, &x) in lr[k].iter().enumerate() {
+                    unsafe { np_.set(x as usize, (br[k] + j) as u32); }
+                }
+            });
+        }
+        drop(lists);
+        drop(vis);
+
+        // new offsets (indexed by new id)
+        let bt = (n + nt - 1) / nt;
+        let mut no = vec![0u32; n + 1];
+        {
+            let nop = P(no.as_mut_ptr());
+            let (o, nr_) = (&off, &nid);
+            par(nt, |k| {
+                for u in k * bt..min(n, (k + 1) * bt) {
+                    unsafe { nop.set(nr_[u] as usize + 1, o[u + 1] - o[u]); }
+                }
+            });
+        }
+        for i in 0..n { no[i + 1] += no[i]; }
+
+        // copy edges: old nodes in order (sequential reads), release old pages as they are consumed
+        let mut na = vec![0u64; e_];
+        {
+            let nap = P(na.as_mut_ptr());
+            let oa = adj.as_ptr() as usize;
+            let (o, a, nr_, nn) = (&off, &adj, &nid, &no);
+            par(nt, |k| {
+                let (a0, a1) = (k * bt, min(n, (k + 1) * bt));
+                let mut u = a0;
+                while u < a1 {
+                    let ue = min(a1, u + 65536);
+                    for x in u..ue {
+                        let mut dst = nn[nr_[x] as usize] as usize;
+                        for i in o[x] as usize..o[x + 1] as usize {
+                            let e = a[i];
+                            let to = nr_[e as u32 as usize] as u64;
+                            unsafe { nap.set(dst, to | (e & 0xFFFF_FFFF_0000_0000)); }
+                            dst += 1;
+                        }
+                    }
+                    release(oa, o[u] as usize, o[ue] as usize);
+                    u = ue;
+                }
+            });
+        }
+        off = no;
+        adj = na;
+        for &i in &pend {
+            let q = &mut qs[i as usize];
+            q.0 = nid[q.0 as usize];
+            q.1 = nid[q.1 as usize];
+        }
+    }
+    drop(nid);
+
+    // ---- run the remaining queries ----
+    pend.sort_unstable_by_key(|&i| qs[i as usize].0);
+    let np = pend.len();
     {
         let ap = P(ans.as_mut_ptr());
         let nx = AtomicUsize::new(0);
-        let (g, qs, od) = (&g, &qs, &od);
-        // Sorted queries are handed out in big contiguous chunks, shrinking towards the end.
-        par(min(nt, max(1, nq)), |_| {
-            let mut s = Sc {
-                l: [vec![0u64; n], vec![0u64; n]],
-                t: [Vec::new(), Vec::new()],
-                h: [Heap { a: Vec::new() }, Heap { a: Vec::new() }],
-            };
+        let (offr, adjr, qr, pr) = (&off, &adj, &qs, &pend);
+        // Sorted queries go out in big contiguous chunks (each thread touches a compact slice of its
+        // label array), shrinking towards the end so the threads finish together.
+        par(min(nt, max(1, np)), |_| {
+            let mut s = Sc { l: vec![0u64; n], t: Vec::new(), h: Heap { a: Vec::new() } };
             loop {
                 let i = nx.load(Relaxed);
-                if i >= nq { break; }
-                let c = if i < nq * 2 / 3 { (3 * nq + 4 * nt - 1) / (4 * nt) } else { max(2, (nq - i) / (2 * nt)) };
+                if i >= np { break; }
+                let c = if i < np * 2 / 3 { (3 * np + 4 * nt - 1) / (4 * nt) } else { max(2, (np - i) / (2 * nt)) };
                 if nx.compare_exchange_weak(i, i + c, Relaxed, Relaxed).is_err() { continue; }
-                for j in i..min(i + c, nq) {
-                    let q = od[j] as usize;
-                    let r = solve(g, &mut s, qs[q].0, qs[q].1);
+                for j in i..min(i + c, np) {
+                    let q = pr[j] as usize;
+                    let r = solve(offr, adjr, &mut s, qr[q].0, qr[q].1);
                     unsafe { ap.set(q, r); }
                 }
             }
