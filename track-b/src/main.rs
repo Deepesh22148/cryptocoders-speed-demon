@@ -477,22 +477,25 @@ fn main() {
         if plan.bools <= 1 << 16 { index_range::<u16>(&path, a, b, &plan) } else { index_range::<u32>(&path, a, b, &plan) }
     });
 
-    // Threads answer blocks of 64 queries.
-    let blocks = par(qs.len().div_ceil(64), threads, |b| {
+    // Threads answer blocks of queries slice by slice, so each slice's index
+    // stays cache-hot across the block.
+    const QB: usize = 1024;
+    let blocks = par(qs.len().div_ceil(QB), threads, |b| {
         let (mut buf, mut r, mut l) = (Vec::new(), Vec::new(), Vec::new());
-        for q in &qs[b * 64..(b * 64 + 64).min(qs.len())] {
-            let (mut count, mut sum, mut first) = (0, 0u64, Vec::<u64>::new());
-            for s in &ix {
+        let block = &qs[b * QB..(b * QB + QB).min(qs.len())];
+        let mut acc = vec![(0, 0u64, Vec::<u64>::new()); block.len()];
+        for s in &ix {
+            for (q, (count, sum, first)) in block.iter().zip(&mut acc) {
                 match q {
                     Query::Phrase(p) => {
                         let ids = &s.hits[s.hoff[*p as usize] as usize..s.hoff[*p as usize + 1] as usize];
-                        count += ids.len() as u64;
-                        sum += ids.iter().map(|&x| x as u64).sum::<u64>();
+                        *count += ids.len() as u64;
+                        *sum += ids.iter().map(|&x| x as u64).sum::<u64>();
                         first.extend(ids.iter().take(10 - first.len()).map(|&x| x as u64));
                     }
                     Query::Bool(terms, ops) if !run(s, terms, ops, &mut l, &mut r) => {
-                        count += l.len() as u64;
-                        sum += l.iter().map(|&d| (s.first + d as u32) as u64).sum::<u64>();
+                        *count += l.len() as u64;
+                        *sum += l.iter().map(|&d| (s.first + d as u32) as u64).sum::<u64>();
                         first.extend(l.iter().take(10 - first.len()).map(|&d| (s.first + d as u32) as u64));
                     }
                     Query::Bool(..) => {
@@ -500,7 +503,7 @@ fn main() {
                             // Sum of set bit positions, one popcount per index bit.
                             let (base, c) = (s.first as u64 + 64 * i as u64, x.count_ones() as u64);
                             let pos: u64 = MASKS.iter().enumerate().map(|(k, m)| ((x & m).count_ones() as u64) << k).sum();
-                            (count, sum) = (count + c, sum + base * c + pos);
+                            (*count, *sum) = (*count + c, *sum + base * c + pos);
                             let mut y = x;
                             while first.len() < 10 && y != 0 {
                                 first.push(base + y.trailing_zeros() as u64);
@@ -510,6 +513,8 @@ fn main() {
                     }
                 }
             }
+        }
+        for (count, sum, first) in acc {
             write!(buf, "{count} {sum}").unwrap();
             first.iter().for_each(|x| write!(buf, " {x}").unwrap());
             buf.push(b'\n');
