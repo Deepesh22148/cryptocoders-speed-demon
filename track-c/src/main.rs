@@ -3,13 +3,13 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 const BOM: u8 = 0xEF; // first byte of EF BB BF; a record never starts with it otherwise
-const CHUNK: usize = 1 << 16;
+const CHUNK: usize = 1 << 15;
 const SLOTS: usize = 1 << 17;
 const ONES: u64 = 0x0101_0101_0101_0101;
 
 
 type Table = [[AtomicU64; 5]];
-type Agg = [i64; 7]; // count, id sum, amount sum, min, max, name bytes, note bytes
+type Agg = [i64; 8]; // count, id sum, amount sum, min, max, name bytes, note bytes, names
 
 fn prefetch<T>(p: *const T) {
     #[cfg(target_arch = "x86_64")]
@@ -22,7 +22,19 @@ fn eat(b: &[u8], p: &mut usize, c: u8) -> Option<()> {
     (*b.get(*p)? == c).then(|| *p += 1)
 }
 
+// Up to seven digits at once (SWAR); longer runs and the buffer's last bytes take the loop.
 fn num(b: &[u8], p: &mut usize) -> Option<i64> {
+    if let Some(w) = b.get(*p..*p + 8) {
+        let x = u64::from_le_bytes(w.try_into().unwrap()) ^ 0x30 * ONES;
+        let n = ((x.wrapping_add(0x76 * ONES) | x) & ONES << 7).trailing_zeros() as usize / 8;
+        if (1..8).contains(&n) {
+            let mut v = x << (64 - 8 * n);
+            v = (v * 10 + (v >> 8)) & 0x00FF_00FF_00FF_00FF;
+            v = (v * 100 + (v >> 16)) & 0x0000_FFFF_0000_FFFF;
+            *p += n;
+            return Some(((v * 10000 + (v >> 32)) & 0xFFFF_FFFF) as i64);
+        }
+    }
     let mut v = 0;
     while b.get(*p)?.is_ascii_digit() {
         (v, *p) = (v * 10 + (b[*p] - b'0') as i64, *p + 1);
@@ -77,16 +89,14 @@ fn hash(b: &[u8], s: usize, e: usize) -> u64 {
     (h ^ h >> 32).wrapping_mul(0xD6E8_FEB8_6659_FD93) | 1
 }
 
-fn mark(t: &Table, h: u64, g: usize) {
+// Sets group g's bit for name h; true if this call set it, so each distinct pair counts once.
+fn mark(t: &Table, h: u64, g: usize) -> bool {
     let mut i = (h >> 47) as usize;
     loop {
         let k = t[i][0].load(Relaxed);
         if k == h || k == 0 && t[i][0].compare_exchange(0, h, Relaxed, Relaxed).map_or_else(|x| x == h, |_| true) {
             let (w, bit) = (&t[i][1 + g / 64], 1 << (g % 64));
-            if w.load(Relaxed) & bit == 0 {
-                w.fetch_or(bit, Relaxed);
-            }
-            return;
+            return w.load(Relaxed) & bit == 0 && w.fetch_or(bit, Relaxed) & bit == 0;
         }
         i = (i + 1) % SLOTS;
     }
@@ -121,13 +131,13 @@ fn record(b: &[u8], mut p: usize, region: &[u8], t: &Table, aggs: &mut [Agg]) ->
         a[i] += x;
     }
     (a[3], a[4]) = (a[3].min(v), a[4].max(v));
-    mark(t, h, g);
+    a[7] += mark(t, h, g) as i64;
     Some(p)
 }
 
 // Streams the records that start in [start, end) through one buffer; the last may run past end.
 fn scan(path: &str, start: u64, end: u64, region: &[u8], t: &Table, groups: usize) -> Vec<Agg> {
-    let mut aggs = vec![[0, 0, 0, i64::MAX, i64::MIN, 0, 0]; groups];
+    let mut aggs = vec![[0, 0, 0, i64::MAX, i64::MIN, 0, 0, 0]; groups];
     let mut f = File::open(path).unwrap();
     f.seek(SeekFrom::Start(start)).unwrap();
     let (mut buf, mut n, mut pos, mut base) = (vec![0; CHUNK], 0, 0, start);
@@ -171,19 +181,28 @@ fn main() {
     let out_dir = dir("SPEED_DEMON_OUTPUT_DIR", "/out");
     let threads = std::thread::available_parallelism().map_or(12, |n| n.get()) as u64;
 
-    // Groups are the sorted country codes, then _UNMATCHED ('_' sorts after 'Z').
-    let rtext = std::fs::read_to_string(format!("{data}/regions.csv")).unwrap();
-    let rows: Vec<_> = rtext.lines().filter_map(|l| l.split_once(',')).collect();
-    let mut keys: Vec<&str> = rows[1..].iter().map(|r| r.1).collect();
-    keys.sort_unstable();
-    keys.dedup();
-    let mut region = vec![u8::MAX; 1 << 20];
-    for &(r, c) in &rows[1..] {
-        let r: usize = r.parse().unwrap();
-        region.resize(region.len().max(r + 1), u8::MAX);
-        region[r] = keys.binary_search(&c).unwrap() as u8;
-    }
-    keys.push("_UNMATCHED");
+    // Groups are the sorted country codes, then _UNMATCHED ('_' sorts after 'Z'). A code is
+    // [A-Z]{3}, so its base-26 value orders codes the same way the bytes do.
+    let (keys, region) = {
+        let rtext = std::fs::read(format!("{data}/regions.csv")).unwrap();
+        let rows = || rtext.split(|&c| c == b'\n').skip(1).filter(|l| l.len() > 4);
+        let code = |l: &[u8]| l[l.len() - 3..].iter().fold(0, |a, &c| a * 26 + (c - b'A') as usize);
+        let mut rank = vec![-1; 26 * 26 * 26];
+        rows().for_each(|l| rank[code(l)] = 0);
+        let mut keys = Vec::new();
+        for (c, r) in rank.iter_mut().enumerate().filter(|(_, r)| **r == 0) {
+            *r = keys.len() as i32;
+            keys.push([c / 676, c / 26 % 26, c % 26].map(|x| (b'A' + x as u8) as char).iter().collect());
+        }
+        let mut region = vec![u8::MAX; 1 << 20];
+        for l in rows() {
+            let r = l[..l.len() - 4].iter().fold(0, |a, &c| a * 10 + (c - b'0') as usize);
+            region.resize(region.len().max(r + 1), u8::MAX);
+            region[r] = rank[code(l)] as u8;
+        }
+        keys.push("_UNMATCHED".to_string());
+        (keys, region)
+    };
     assert!(keys.len() < 256, "too many countries");
 
     // records.csv: skip the BOM and header, then cut at record starts, one range per thread.
@@ -206,21 +225,13 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    let mut distinct = [0; 256];
-    for (w, word) in table.iter().flat_map(|slot| slot[1..].iter().enumerate()) {
-        let mut bits = word.load(Relaxed);
-        while bits != 0 {
-            distinct[w * 64 + bits.trailing_zeros() as usize] += 1;
-            bits &= bits - 1;
-        }
-    }
     let mut out = Vec::new();
     for (g, key) in keys.iter().enumerate() {
         let sum = |i| parts.iter().map(|p| p[g][i]).sum::<i64>();
         let min = parts.iter().map(|p| p[g][3]).min().unwrap();
         let max = parts.iter().map(|p| p[g][4]).max().unwrap();
         if sum(0) > 0 {
-            let (n, ids, total, nb, tb, d) = (sum(0), sum(1), money(sum(2)), sum(5), sum(6), distinct[g]);
+            let (n, ids, total, nb, tb, d) = (sum(0), sum(1), money(sum(2)), sum(5), sum(6), sum(7));
             let (min, max) = (money(min), money(max));
             writeln!(out, "{key} {n} {ids} {total} {min} {max} {d} {nb} {tb}").unwrap();
         }
