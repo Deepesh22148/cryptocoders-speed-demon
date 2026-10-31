@@ -377,35 +377,51 @@ fn index_lines<L: Copy + Default + TryFrom<u32> + Into<u32>>(
     true
 }
 
-/// Evaluate a BOOL query on one slice into `r`, a bitmap of local doc indexes.
-fn run(s: &Slice, terms: &[u32], ops: &[u8], r: &mut Vec<u64>, tmp: &mut Vec<u64>) {
-    r.clear();
-    r.resize(s.w, 0);
+/// Evaluate a BOOL query on one slice. The result is the sorted local doc
+/// indexes in `l` while only sparse terms feed it, else bitmap `r`; returns
+/// whether `r` holds it.
+fn run(s: &Slice, terms: &[u32], ops: &[u8], l: &mut Vec<u16>, r: &mut Vec<u64>) -> bool {
+    let (mut bits, w) = (false, s.w);
+    l.clear();
     for (i, &t) in terms.iter().enumerate() {
         let (op, k) = (if i == 0 { b'O' } else { ops[i - 1] }, s.bm[t as usize] as usize);
-        if k != NO as usize {
-            let b = &s.bits[k * s.w..(k + 1) * s.w];
-            match op {
-                b'A' => r.iter_mut().zip(b).for_each(|(x, y)| *x &= y),
-                b'O' => r.iter_mut().zip(b).for_each(|(x, y)| *x |= y),
-                _ => r.iter_mut().zip(b).for_each(|(x, y)| *x &= !y),
-            }
-            continue;
-        }
         let list = &s.ids[s.off[t as usize] as usize..s.off[t as usize + 1] as usize];
-        match op {
-            b'A' => {
-                tmp.clear();
-                tmp.resize(s.w, 0);
-                for &d in list {
-                    tmp[d as usize / 64] |= r[d as usize / 64] & 1 << (d % 64);
-                }
-                std::mem::swap(r, tmp);
+        let has = |d: u16| s.bits[k * w + d as usize / 64] >> (d % 64) & 1 == 1;
+        let inr = |r: &[u64], d: u16| r[d as usize / 64] >> (d % 64) & 1 == 1;
+        match (bits, op, k != NO as usize) {
+            (false, b'O', true) => {
+                r.clear();
+                r.extend_from_slice(&s.bits[k * w..(k + 1) * w]);
+                l.iter().for_each(|&d| r[d as usize / 64] |= 1 << (d % 64));
+                bits = true;
             }
-            b'O' => list.iter().for_each(|&d| r[d as usize / 64] |= 1 << (d % 64)),
-            _ => list.iter().for_each(|&d| r[d as usize / 64] &= !(1 << (d % 64))),
+            (false, b'O', false) => {
+                l.extend_from_slice(list);
+                l.sort_unstable();
+                l.dedup();
+            }
+            (false, b'A', true) => l.retain(|&d| has(d)),
+            (false, b'A', false) => l.retain(|d| list.binary_search(d).is_ok()),
+            (false, _, true) => l.retain(|&d| !has(d)),
+            (false, _, false) => l.retain(|d| list.binary_search(d).is_err()),
+            (true, b'A', false) => {
+                l.clear();
+                l.extend(list.iter().filter(|&&d| inr(r, d)));
+                bits = false;
+            }
+            (true, b'O', false) => list.iter().for_each(|&d| r[d as usize / 64] |= 1 << (d % 64)),
+            (true, _, false) => list.iter().for_each(|&d| r[d as usize / 64] &= !(1 << (d % 64))),
+            (true, op, true) => {
+                let b = &s.bits[k * w..(k + 1) * w];
+                match op {
+                    b'A' => r.iter_mut().zip(b).for_each(|(x, y)| *x &= y),
+                    b'O' => r.iter_mut().zip(b).for_each(|(x, y)| *x |= y),
+                    _ => r.iter_mut().zip(b).for_each(|(x, y)| *x &= !y),
+                }
+            }
         }
     }
+    bits
 }
 
 const MASKS: [u64; 6] = [
@@ -463,7 +479,7 @@ fn main() {
 
     // Threads answer blocks of 64 queries.
     let blocks = par(qs.len().div_ceil(64), threads, |b| {
-        let (mut buf, mut r, mut tmp) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut buf, mut r, mut l) = (Vec::new(), Vec::new(), Vec::new());
         for q in &qs[b * 64..(b * 64 + 64).min(qs.len())] {
             let (mut count, mut sum, mut first) = (0, 0u64, Vec::<u64>::new());
             for s in &ix {
@@ -474,8 +490,12 @@ fn main() {
                         sum += ids.iter().map(|&x| x as u64).sum::<u64>();
                         first.extend(ids.iter().take(10 - first.len()).map(|&x| x as u64));
                     }
-                    Query::Bool(terms, ops) => {
-                        run(s, terms, ops, &mut r, &mut tmp);
+                    Query::Bool(terms, ops) if !run(s, terms, ops, &mut l, &mut r) => {
+                        count += l.len() as u64;
+                        sum += l.iter().map(|&d| (s.first + d as u32) as u64).sum::<u64>();
+                        first.extend(l.iter().take(10 - first.len()).map(|&d| (s.first + d as u32) as u64));
+                    }
+                    Query::Bool(..) => {
                         for (i, &x) in r.iter().enumerate().filter(|w| *w.1 != 0) {
                             // Sum of set bit positions, one popcount per index bit.
                             let (base, c) = (s.first as u64 + 64 * i as u64, x.count_ones() as u64);
