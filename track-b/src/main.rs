@@ -449,9 +449,10 @@ fn main() {
     let got = File::open(&path).unwrap().read(&mut sample).unwrap();
     let (qs, plan) = parse(&qtext, &sample[..got]);
 
-    // At least 8 slices keep each one's doc count within u16 local indexes.
+    // Two slices per thread balance the load; at least 8 keep each one's doc
+    // count within u16 local indexes.
     let len = std::fs::metadata(&path).unwrap().len();
-    let ns = threads.max(8) as u64;
+    let ns = (threads * 2).max(8) as u64;
     let ix = par(ns as usize, threads, |i| {
         let (a, b) = (len * i as u64 / ns, len * (i as u64 + 1) / ns);
         if plan.bools <= 1 << 16 { index_range::<u16>(&path, a, b, &plan) } else { index_range::<u32>(&path, a, b, &plan) }
