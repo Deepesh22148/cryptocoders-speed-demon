@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -44,8 +45,8 @@ static inline u64 readNum(const char*& p, const char* end) {
 }
 
 // Forward CSR (dir 0) and reverse CSR (dir 1).
-static std::vector<u32> offs[2];
-static std::vector<Edge> adjs[2];
+static u32* offs[2];
+static Edge* adjs[2];
 
 // ---- 4-ary min-heap with lazy deletion ----
 template <class D>
@@ -130,8 +131,8 @@ static i64 solve(Scratch<D>& S, u32 s, u32 t) {
         auto e = S.heap[side].pop();
         u32 u = e.v;
         D d = e.k;
-        const u32* off = offs[side].data();
-        const Edge* adj = adjs[side].data();
+        const u32* off = offs[side];
+        const Edge* adj = adjs[side];
         D* mine = S.lab[side];
         const D* other = S.lab[side ^ 1];
         auto& H = S.heap[side];
@@ -164,18 +165,21 @@ static i64 solve(Scratch<D>& S, u32 s, u32 t) {
 
 template <class D>
 static void runQueries(size_t n, const std::vector<std::pair<u32, u32>>& qs,
-                       std::vector<i64>& ans, unsigned nthreads) {
+                       const std::vector<u32>& order, std::vector<i64>& ans, unsigned nthreads) {
     std::atomic<size_t> next{0};
     if (nthreads > qs.size()) nthreads = (unsigned)std::max<size_t>(1, qs.size());
     std::vector<std::thread> pool;
     for (unsigned k = 0; k < nthreads; ++k) {
         pool.emplace_back([&] {
             Scratch<D> S(n);
-            constexpr size_t CHUNK = 4;
+            constexpr size_t CHUNK = 2;
             size_t i;
             while ((i = next.fetch_add(CHUNK)) < qs.size()) {
                 size_t hi = std::min(i + CHUNK, qs.size());
-                for (; i < hi; ++i) ans[i] = solve<D>(S, qs[i].first, qs[i].second);
+                for (; i < hi; ++i) {
+                    u32 qi = order[i];
+                    ans[qi] = solve<D>(S, qs[qi].first, qs[qi].second);
+                }
             }
         });
     }
@@ -202,7 +206,14 @@ int main() {
     T0 = std::chrono::steady_clock::now();
     TIMING = getenv("TIMING") != nullptr;
 
-    const unsigned NT = 12;  // tune to the scorer's core count
+    unsigned NT = 12;  // cap; lowered if the container exposes fewer CPUs
+    {
+        cpu_set_t cs;
+        if (sched_getaffinity(0, sizeof(cs), &cs) == 0) {
+            unsigned c = (unsigned)CPU_COUNT(&cs);
+            if (c >= 1 && c < NT) NT = c;
+        }
+    }
 
     size_t glen;
     const char* g = mapFile("/data/graph.txt", glen, false);
@@ -259,35 +270,71 @@ int main() {
     munmap((void*)g, glen);
     lap("parse");
 
-    // ---- parallel CSR build (forward + reverse) ----
+    // ---- cache-friendly CSR build (forward + reverse) ----
+    // 1) histogram edges by node-range bucket, 2) scatter into bucket order (no atomics),
+    // 3) each bucket is turned into CSR by one thread, entirely inside L2 cache.
+    const unsigned SH = 15;  // 32768 nodes per bucket
     unsigned T = (unsigned)parts.size();
-    offs[0].assign(n + 1, 0);
-    offs[1].assign(n + 1, 0);
+    size_t B = (n >> SH) + 1;
+    std::vector<std::vector<size_t>> pF(T, std::vector<size_t>(B, 0)), pR(T, std::vector<size_t>(B, 0));
     parallelRun(T, [&](unsigned k) {
+        for (const E3& e : parts[k]) { ++pF[k][e.u >> SH]; ++pR[k][e.v >> SH]; }
+    });
+    std::vector<size_t> bsF(B + 1), bsR(B + 1);
+    size_t E = 0;
+    {
+        size_t runF = 0, runR = 0;
+        for (size_t b = 0; b < B; ++b) {
+            bsF[b] = runF; bsR[b] = runR;
+            for (unsigned k = 0; k < T; ++k) {
+                size_t cf = pF[k][b], cr = pR[k][b];
+                pF[k][b] = runF; pR[k][b] = runR;
+                runF += cf; runR += cr;
+            }
+        }
+        bsF[B] = runF; bsR[B] = runR;
+        E = runF;
+    }
+    E3* tmpF = new E3[E ? E : 1];  // uninitialised on purpose; pages get touched in parallel
+    E3* tmpR = new E3[E ? E : 1];
+    parallelRun(T, [&](unsigned k) {
+        auto& pf = pF[k];
+        auto& pr = pR[k];
         for (const E3& e : parts[k]) {
-            __atomic_fetch_add(&offs[0][e.u + 1], 1u, __ATOMIC_RELAXED);
-            __atomic_fetch_add(&offs[1][e.v + 1], 1u, __ATOMIC_RELAXED);
+            tmpF[pf[e.u >> SH]++] = e;
+            tmpR[pr[e.v >> SH]++] = e;
         }
     });
-    for (int s = 0; s < 2; ++s)
-        for (size_t i = 0; i < n; ++i) offs[s][i + 1] += offs[s][i];
+    parts.clear(); parts.shrink_to_fit();
 
-    size_t E = offs[0][n];
-    adjs[0].resize(E);
-    adjs[1].resize(E);
-    {
-        std::vector<u32> pf(offs[0].begin(), offs[0].end() - 1);
-        std::vector<u32> pb(offs[1].begin(), offs[1].end() - 1);
-        parallelRun(T, [&](unsigned k) {
-            for (const E3& e : parts[k]) {
-                u32 i = __atomic_fetch_add(&pf[e.u], 1u, __ATOMIC_RELAXED);
-                adjs[0][i] = {e.v, e.w};
-                u32 j = __atomic_fetch_add(&pb[e.v], 1u, __ATOMIC_RELAXED);
-                adjs[1][j] = {e.u, e.w};
+    for (int s = 0; s < 2; ++s) {
+        offs[s] = (u32*)malloc((n + 1) * sizeof(u32));
+        adjs[s] = (Edge*)malloc((E ? E : 1) * sizeof(Edge));
+        offs[s][n] = (u32)E;
+    }
+    auto buildDir = [&](const E3* tmp, const std::vector<size_t>& bs, bool fwd, u32* off, Edge* adj) {
+        std::atomic<size_t> nb{0};
+        parallelRun(NT, [&](unsigned) {
+            std::vector<u32> cnt;
+            size_t b;
+            while ((b = nb.fetch_add(1)) < B) {
+                size_t lo = b << SH, hi = std::min(n, (b + 1) << SH);
+                size_t sz = hi > lo ? hi - lo : 0;
+                cnt.assign(sz, 0);
+                size_t i0 = bs[b], i1 = bs[b + 1];
+                if (fwd) for (size_t i = i0; i < i1; ++i) ++cnt[tmp[i].u - lo];
+                else     for (size_t i = i0; i < i1; ++i) ++cnt[tmp[i].v - lo];
+                u32 run = (u32)i0;
+                for (size_t j = 0; j < sz; ++j) { u32 c = cnt[j]; off[lo + j] = run; cnt[j] = run; run += c; }
+                if (fwd) for (size_t i = i0; i < i1; ++i) { const E3& e = tmp[i]; adj[cnt[e.u - lo]++] = {e.v, e.w}; }
+                else     for (size_t i = i0; i < i1; ++i) { const E3& e = tmp[i]; adj[cnt[e.v - lo]++] = {e.u, e.w}; }
             }
         });
-    }
-    parts.clear(); parts.shrink_to_fit();
+    };
+    buildDir(tmpF, bsF, true, offs[0], adjs[0]);
+    delete[] tmpF;
+    buildDir(tmpR, bsR, false, offs[1], adjs[1]);
+    delete[] tmpR;
     lap("build");
 
     // ---- queries ----
@@ -307,8 +354,11 @@ int main() {
     // If that fits in 32 bits (with room for the +1 label code), use 32-bit labels.
     u64 bound = std::min<u64>(sumW, maxW * (u64)n);
     std::vector<i64> ans(queries.size());
-    if (bound < 0xFFFFFFF0ULL) runQueries<u32>(n, queries, ans, NT);
-    else runQueries<u64>(n, queries, ans, NT);
+    std::vector<u32> order(queries.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = (u32)i;
+    std::sort(order.begin(), order.end(), [&](u32 a, u32 b) { return queries[a].first < queries[b].first; });
+    if (bound < 0xFFFFFFF0ULL) runQueries<u32>(n, queries, order, ans, NT);
+    else runQueries<u64>(n, queries, order, ans, NT);
     lap("solve");
 
     std::string out;
@@ -327,5 +377,5 @@ int main() {
     fwrite(out.data(), 1, out.size(), f);
     fclose(f);
     lap("write");
-    return 0;
+    _exit(0);  // skip freeing ~hundreds of MB at teardown
 }
