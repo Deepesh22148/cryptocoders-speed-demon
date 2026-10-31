@@ -11,10 +11,15 @@ const ONES: u64 = 0x0101_0101_0101_0101;
 type Table = [[AtomicU64; 5]];
 type Agg = [i64; 8]; // count, id sum, amount sum, min, max, name bytes, note bytes, names
 
-fn prefetch<T>(p: *const T) {
+// Hints that *p is needed soon; `write` asks for the line in exclusive state (prefetchw),
+// which saves a second cache-coherence round trip before an atomic update.
+fn prefetch<T>(p: *const T, write: bool) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0)
+        match write {
+            true => std::arch::asm!("prefetchw [{}]", in(reg) p, options(nostack, readonly)),
+            false => std::arch::asm!("prefetcht0 [{}]", in(reg) p, options(nostack, readonly)),
+        }
     }
 }
 
@@ -96,7 +101,7 @@ fn mark(t: &Table, h: u64, g: usize) -> bool {
         let k = t[i][0].load(Relaxed);
         if k == h || k == 0 && t[i][0].compare_exchange(0, h, Relaxed, Relaxed).map_or_else(|x| x == h, |_| true) {
             let (w, bit) = (&t[i][1 + g / 64], 1 << (g % 64));
-            return w.load(Relaxed) & bit == 0 && w.fetch_or(bit, Relaxed) & bit == 0;
+            return w.fetch_or(bit, Relaxed) & bit == 0;
         }
         i = (i + 1) % SLOTS;
     }
@@ -111,10 +116,10 @@ fn record(b: &[u8], mut p: usize, region: &[u8], t: &Table, aggs: &mut [Agg]) ->
     let (s, e, name) = text(b, &mut p)?;
     let h = hash(b, s, e);
     let slot = &t[(h >> 47) as usize];
-    (prefetch(&slot[0]), prefetch(&slot[4]));
+    (prefetch(&slot[0], true), prefetch(&slot[4], true));
     let note = text(b, &mut p)?.2;
     let rid = num(b, &mut p)? as usize;
-    prefetch(region.as_ptr().wrapping_add(rid));
+    prefetch(region.as_ptr().wrapping_add(rid), false);
     eat(b, &mut p, b',')?;
     let neg = eat(b, &mut p, b'-').is_some();
     let whole = num(b, &mut p)?;

@@ -33,3 +33,10 @@ From step 6 on, numbers are from a static Linux (musl) build run in WSL2 on the 
 After step 9, peak RSS is under 7.3 MB, which is M_ref / 50, so the memory factor is at its cap.
 
 Linux profile before step 7 (in-program timers): regions ~45 ms, scan ~130 ms, merge ~7 ms. Raw read of the file from tmpfs is ~0.02 s single-threaded, so the scan is compute-bound.
+| 11 | Name-table bit set with a plain `fetch_or` (no load-then-check: ~97% of marks set a new bit, so the check only added a shared-to-exclusive upgrade), and the slot prefetched with `prefetchw` (inline asm, so no unstable target feature) so it arrives in exclusive state for the atomic | Pending | min −4% (`fetch_or`), −5 to −11% with `prefetchw` | 6.8 | |
+
+Linux ablation before step 11 (min of 15 interleaved runs, 8 threads): total ~100–112 ms, name table ~37 ms, hashing ~9 ms, parsing ~39 ms, read + line scan ~27 ms (includes ~6 ms region load and ~10 ms start-up).
+
+Tried and dropped in this round: an 8- or 16-deep pipeline that delays each table update so its prefetch has more lead time (≤3%, within noise, adds code); a single-pass region load through a temporary `u16` table (6 ms → 9 ms, more page faults).
+
+Measurement note: during this round a long-running background job held one to two cores, so wall-time medians were noisy; decisions used min times of interleaved A/B runs.
