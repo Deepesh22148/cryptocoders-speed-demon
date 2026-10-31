@@ -1,5 +1,4 @@
-# Read by the board and the scoring harness.
 track = "b"
 team = "cryptocoders"
-language = "Python"
-dependency_count = 4
+language = "rust"
+dependency_count = 0
