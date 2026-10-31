@@ -33,6 +33,11 @@ impl Hasher for Fx {
 
 type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
 const NO: u32 = u32::MAX;
+// A phrase id's top bits flag terms that open (bit 31) or close (bit 30) some
+// phrase's anchor pair; `PID` masks them off and is the id of non-phrase tokens.
+const PID: u32 = (1 << 30) - 1;
+// Docs per slice scanned before its common terms switch to direct bitmaps.
+const PROBE: usize = 1024;
 
 enum Query {
     Bool(Vec<u32>, Vec<u8>),
@@ -61,24 +66,27 @@ fn pair(a: u32, b: u32) -> (u64, usize) {
     (k, (k.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 44) as usize)
 }
 
-/// Results for one byte range of the corpus: sorted doc ids per BOOL term (CSR:
-/// term t's docs are `ids[off[t]..off[t + 1]]`) and per phrase. Ranges hold
-/// disjoint ascending doc ids, so they are never merged. During the scan each
-/// doc's new BOOL term ids are appended to `log`, ending at `docs[i].1`.
+/// Results for one byte range of the corpus, which holds docs `first..` (ranges
+/// are disjoint and ascending, so they are never merged). A common BOOL term has
+/// bitmap `bm[t]` (`w` words in `bits`) over local doc indexes; any other term
+/// has the sorted local indexes `ids[off[t]..off[t + 1]]`. Phrases have sorted
+/// doc ids. During the scan each doc's new BOOL term ids are appended to `log`,
+/// ending at `docs[i].1`, except for terms already common in the first `PROBE`
+/// docs, which set bits in `early[dk[t]]` directly.
 #[derive(Default)]
 struct Slice {
     log: Vec<u32>,
     docs: Vec<(u32, u32)>,
     last: Vec<u32>,
+    dk: Vec<u32>,
+    early: Vec<Vec<u64>>,
+    first: u32,
+    w: usize,
+    bm: Vec<u32>,
+    bits: Vec<u64>,
     off: Vec<u32>,
     ids: Vec<u32>,
     phr: Vec<Vec<u32>>,
-}
-
-impl Slice {
-    fn post(&self, t: u32) -> &[u32] {
-        &self.ids[self.off[t as usize] as usize..self.off[t as usize + 1] as usize]
-    }
 }
 
 fn parse(input: &[u8]) -> (Vec<Query>, Plan<'_>) {
@@ -116,9 +124,15 @@ fn parse(input: &[u8]) -> (Vec<Query>, Plan<'_>) {
         }
     }
     p.bloom = vec![0; 1 << 14];
+    let mut flags = vec![0u32; p.pids as usize];
     for k in p.pairs.keys() {
         let h = (k.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 44) as usize;
         p.bloom[h / 64] |= 1 << (h % 64);
+        flags[(k >> 32) as usize] |= 1 << 31;
+        flags[(*k as u32) as usize] |= 1 << 30;
+    }
+    for v in p.terms.values_mut() {
+        v.1 = if v.1 == NO { PID } else { v.1 | flags[v.1 as usize] };
     }
     for (w, &v) in p.terms.iter().filter(|(w, _)| w.len() <= 16) {
         p.short.insert(w.iter().rev().fold(0, |k, &c| k << 8 | c as u128), v);
@@ -129,7 +143,9 @@ fn parse(input: &[u8]) -> (Vec<Query>, Plan<'_>) {
 /// Index the lines of `path` that start in `start..end`, streaming the file.
 fn index_range(path: &Path, start: u64, end: u64, p: &Plan) -> Slice {
     let n = p.bools as usize;
-    let mut sl = Slice { phr: vec![Vec::new(); p.phrases.len()], last: vec![NO; n], ..Default::default() };
+    let mut sl = Slice { phr: vec![Vec::new(); p.phrases.len()], last: vec![NO; n], dk: vec![NO; n], ..Default::default() };
+    // Untouched capacity costs no memory; this just avoids regrowth copies.
+    (sl.log, sl.docs) = (Vec::with_capacity((end - start) as usize / 8), Vec::with_capacity((end - start) as usize / 128));
     let mut f = File::open(path).unwrap();
     // Begin one byte early and drop the first (partial) line, so a line that
     // starts exactly at `start` is kept.
@@ -161,24 +177,35 @@ fn index_range(path: &Path, start: u64, end: u64, p: &Plan) -> Slice {
         buf.copy_within(last + 1..have, 0);
         (off, have) = (off + last as u64 + 1, have - last - 1);
     }
-    // Counting sort of the log into CSR.
-    sl.off = vec![0; n + 1];
+    let (nd, mut cnt) = (sl.docs.len(), vec![0u32; n]);
     for &b in &sl.log {
-        sl.off[b as usize + 1] += 1;
+        cnt[b as usize] += 1;
     }
-    for i in 0..n {
-        sl.off[i + 1] += sl.off[i];
+    (sl.first, sl.w) = (sl.docs.first().map_or(0, |d| d.0), nd.div_ceil(64));
+    let mut dense = 0;
+    sl.bm = (0..n).map(|t| if sl.dk[t] != NO || cnt[t] as usize * 32 >= nd.max(1) { (dense, dense += 1).0 } else { NO }).collect();
+    sl.off = vec![0; n + 1];
+    for t in 0..n {
+        sl.off[t + 1] = sl.off[t] + if sl.bm[t] == NO { cnt[t] } else { 0 };
+    }
+    (sl.bits, sl.ids) = (vec![0; dense as usize * sl.w], vec![0; sl.off[n] as usize]);
+    for (t, &k) in sl.dk.iter().enumerate().filter(|d| *d.1 != NO) {
+        let e = &sl.early[k as usize];
+        sl.bits[sl.bm[t] as usize * sl.w..][..e.len()].copy_from_slice(e);
     }
     let (mut pos, mut s) = (sl.off.clone(), 0);
-    sl.ids = vec![0; sl.log.len()];
-    for &(doc, e) in &sl.docs {
+    for (li, &(_, e)) in sl.docs.iter().enumerate() {
         for &b in &sl.log[s..e as usize] {
-            sl.ids[pos[b as usize] as usize] = doc;
-            pos[b as usize] += 1;
+            let (b, k) = (b as usize, sl.bm[b as usize] as usize);
+            if k != NO as usize {
+                sl.bits[k * sl.w + li / 64] |= 1 << (li % 64);
+            } else {
+                (sl.ids[pos[b] as usize], pos[b]) = (li as u32, pos[b] + 1);
+            }
         }
         s = e as usize;
     }
-    (sl.log, sl.docs, sl.last) = Default::default();
+    (sl.log, sl.docs, sl.last, sl.early) = Default::default();
     sl
 }
 
@@ -213,7 +240,7 @@ fn masks(b: &[u8]) -> (u64, u64) {
 /// bytes follow) whose file offset (`base` + index) is before `end`. A line's
 /// first token is its doc id. Returns false once a line starts at `end`.
 fn index_lines(sl: &mut Slice, seq: &mut Vec<u32>, cand: &mut Vec<usize>, text: &[u8], len: usize, base: u64, end: u64, p: &Plan) -> bool {
-    let (mut doc, mut start, mut in_tok, mut id_next) = (0, 0, false, true);
+    let (mut doc, mut start, mut in_tok, mut id_next, mut prevf) = (0, 0, false, true, 0u32);
     if base >= end {
         return false;
     }
@@ -237,6 +264,7 @@ fn index_lines(sl: &mut Slice, seq: &mut Vec<u32>, cand: &mut Vec<usize>, text: 
                     id_next = false;
                     seq.clear();
                     cand.clear();
+                    prevf = 0;
                     continue;
                 }
                 // Alphanumeric bytes OR 0x20 are their lowercase; tokens over 32
@@ -249,21 +277,40 @@ fn index_lines(sl: &mut Slice, seq: &mut Vec<u32>, cand: &mut Vec<usize>, text: 
                     ..=32 => p.terms.get(&text[s..e].iter().map(|b| b | 0x20).collect::<Vec<u8>>()[..]),
                     _ => None,
                 };
-                let &(bid, pid) = t.unwrap_or(&(NO, NO));
-                if bid != NO && sl.last[bid as usize] != doc {
-                    sl.last[bid as usize] = doc;
-                    sl.log.push(bid);
+                let &(bid, pid) = t.unwrap_or(&(NO, PID));
+                if bid != NO {
+                    let (k, li) = (sl.dk[bid as usize] as usize, sl.docs.len());
+                    if k != NO as usize {
+                        let v = &mut sl.early[k];
+                        if v.len() <= li / 64 {
+                            v.resize(li / 64 + 1, 0);
+                        }
+                        v[li / 64] |= 1 << (li % 64);
+                    } else if sl.last[bid as usize] != doc {
+                        sl.last[bid as usize] = doc;
+                        sl.log.push(bid);
+                    }
                 }
-                if let Some(&prev) = seq.last() {
-                    let h = pair(prev, pid).1;
+                if prevf >> 31 & pid >> 30 & 1 == 1 {
+                    let h = pair(seq[seq.len() - 1], pid & PID).1;
                     if p.bloom[h / 64] >> (h % 64) & 1 != 0 {
                         cand.push(seq.len());
                     }
                 }
-                seq.push(pid);
+                prevf = pid;
+                seq.push(pid & PID);
             }
             if nl >> q & 1 == 1 {
                 sl.docs.push((doc, sl.log.len() as u32));
+                if sl.docs.len() == PROBE {
+                    // Terms already in 1/16 of the docs go straight to bitmaps.
+                    let mut cnt = vec![0u32; sl.last.len()];
+                    sl.log.iter().for_each(|&b| cnt[b as usize] += 1);
+                    for (t, _) in cnt.iter().enumerate().filter(|c| *c.1 as usize * 16 >= PROBE) {
+                        sl.dk[t] = sl.early.len() as u32;
+                        sl.early.push(Vec::new());
+                    }
+                }
                 for &j in cand.iter() {
                     for &(ph, a) in p.pairs.get(&pair(seq[j - 1], seq[j]).0).into_iter().flatten() {
                         let v = &mut sl.phr[ph as usize];
@@ -282,42 +329,45 @@ fn index_lines(sl: &mut Slice, seq: &mut Vec<u32>, cand: &mut Vec<usize>, text: 
     true
 }
 
-/// Elements of `a` that are (`want`) or are not in `b`; binary search when `b` is much larger.
-fn filter(a: &[u32], b: &[u32], want: bool) -> Vec<u32> {
-    let (gallop, mut rest) = (a.len() * 8 <= b.len(), b);
-    let mut keep = |&x: &u32| {
-        let i = if gallop { rest.partition_point(|&y| y < x) } else { rest.iter().take_while(|&&y| y < x).count() };
-        rest = &rest[i..];
-        (rest.first() == Some(&x)) == want
-    };
-    a.iter().copied().filter(|x| keep(x)).collect()
+/// Evaluate a BOOL query on one slice into `r`, a bitmap of local doc indexes.
+fn run(s: &Slice, terms: &[u32], ops: &[u8], r: &mut Vec<u64>, tmp: &mut Vec<u64>) {
+    r.clear();
+    r.resize(s.w, 0);
+    for (i, &t) in terms.iter().enumerate() {
+        let (op, k) = (if i == 0 { b'O' } else { ops[i - 1] }, s.bm[t as usize] as usize);
+        if k != NO as usize {
+            let b = &s.bits[k * s.w..(k + 1) * s.w];
+            match op {
+                b'A' => r.iter_mut().zip(b).for_each(|(x, y)| *x &= y),
+                b'O' => r.iter_mut().zip(b).for_each(|(x, y)| *x |= y),
+                _ => r.iter_mut().zip(b).for_each(|(x, y)| *x &= !y),
+            }
+            continue;
+        }
+        let list = &s.ids[s.off[t as usize] as usize..s.off[t as usize + 1] as usize];
+        match op {
+            b'A' => {
+                tmp.clear();
+                tmp.resize(s.w, 0);
+                for &d in list {
+                    tmp[d as usize / 64] |= r[d as usize / 64] & 1 << (d % 64);
+                }
+                std::mem::swap(r, tmp);
+            }
+            b'O' => list.iter().for_each(|&d| r[d as usize / 64] |= 1 << (d % 64)),
+            _ => list.iter().for_each(|&d| r[d as usize / 64] &= !(1 << (d % 64))),
+        }
+    }
 }
 
-fn union(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let (mut out, mut i, mut j) = (Vec::with_capacity(a.len() + b.len()), 0, 0);
-    while i < a.len() && j < b.len() {
-        out.push(a[i].min(b[j]));
-        (i, j) = (i + (a[i] <= b[j]) as usize, j + (b[j] <= a[i]) as usize);
-    }
-    out.extend_from_slice(&a[i..]);
-    out.extend_from_slice(&b[j..]);
-    out
-}
-
-fn run(s: &Slice, q: &Query) -> Vec<u32> {
-    let Query::Bool(terms, ops) = q else { return Vec::new() };
-    let mut r = s.post(terms[0]).to_vec();
-    for (op, &t) in ops.iter().zip(&terms[1..]) {
-        let p = s.post(t);
-        r = match op {
-            b'A' if r.len() > p.len() => filter(p, &r, true),
-            b'A' => filter(&r, p, true),
-            b'O' => union(&r, p),
-            _ => filter(&r, p, false),
-        };
-    }
-    r
-}
+const MASKS: [u64; 6] = [
+    0xaaaa_aaaa_aaaa_aaaa,
+    0xcccc_cccc_cccc_cccc,
+    0xf0f0_f0f0_f0f0_f0f0,
+    0xff00_ff00_ff00_ff00,
+    0xffff_0000_ffff_0000,
+    0xffff_ffff_0000_0000,
+];
 
 fn main() {
     let dir = |var, default| std::env::var_os(var).map_or(default, |v| v.into_string().unwrap());
@@ -353,17 +403,32 @@ fn main() {
                         if b * 64 >= qs.len() {
                             return mine;
                         }
-                        let mut buf = Vec::new();
+                        let (mut buf, mut r, mut tmp) = (Vec::new(), Vec::new(), Vec::new());
                         for q in &qs[b * 64..(b * 64 + 64).min(qs.len())] {
-                            let (mut count, mut sum, mut first) = (0, 0u64, Vec::<u32>::new());
+                            let (mut count, mut sum, mut first) = (0, 0u64, Vec::<u64>::new());
                             for s in &ix {
-                                let ids = match q {
-                                    Query::Phrase(p) => &s.phr[*p as usize],
-                                    _ => &run(s, q),
-                                };
-                                count += ids.len();
-                                sum += ids.iter().map(|&x| x as u64).sum::<u64>();
-                                first.extend(ids.iter().take(10 - first.len()));
+                                match q {
+                                    Query::Phrase(p) => {
+                                        let ids = &s.phr[*p as usize];
+                                        count += ids.len() as u64;
+                                        sum += ids.iter().map(|&x| x as u64).sum::<u64>();
+                                        first.extend(ids.iter().take(10 - first.len()).map(|&x| x as u64));
+                                    }
+                                    Query::Bool(terms, ops) => {
+                                        run(s, terms, ops, &mut r, &mut tmp);
+                                        for (i, &x) in r.iter().enumerate().filter(|w| *w.1 != 0) {
+                                            // Sum of set bit positions, one popcount per index bit.
+                                            let (base, c) = (s.first as u64 + 64 * i as u64, x.count_ones() as u64);
+                                            let pos: u64 = MASKS.iter().enumerate().map(|(k, m)| ((x & m).count_ones() as u64) << k).sum();
+                                            (count, sum) = (count + c, sum + base * c + pos);
+                                            let mut y = x;
+                                            while first.len() < 10 && y != 0 {
+                                                first.push(base + y.trailing_zeros() as u64);
+                                                y &= y - 1;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             write!(buf, "{count} {sum}").unwrap();
                             first.iter().for_each(|x| write!(buf, " {x}").unwrap());
