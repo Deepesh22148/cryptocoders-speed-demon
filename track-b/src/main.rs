@@ -95,16 +95,19 @@ struct Slice {
 
 /// Scan state of a slice: each doc's new BOOL term ids go to `log` (ending at
 /// `ends[i]`), except for terms already common in the first `PROBE` docs, which
-/// set bits in `early[dk[t]]` directly. `found` collects (phrase, doc) matches.
+/// set bits in bitmap `st[t].1` of `early` (`EW` words each) directly. `st[t].0`
+/// is the last doc that held term t. `found` collects (phrase, doc) matches.
 struct Scan<L> {
     log: Vec<L>,
     ends: Vec<u32>,
-    last: Vec<u32>,
-    dk: Vec<u32>,
-    early: Vec<Vec<u64>>,
+    st: Vec<(u32, u32)>,
+    early: Vec<u64>,
     found: Vec<(u32, u32)>,
     first: u32,
 }
+
+// Bitmap words per early term: a slice holds at most 65536 docs.
+const EW: usize = 1024;
 
 fn parse<'a>(input: &'a [u8], sample: &[u8]) -> (Vec<Query>, Plan<'a>) {
     let (mut p, mut queries, mut seen) = (Plan::default(), Vec::with_capacity(input.len() / 30), Map::default());
@@ -167,7 +170,7 @@ fn index_range<L: Copy + Default + TryFrom<u32> + Into<u32>>(path: &Path, start:
     let n = p.bools as usize;
     // Untouched capacity costs no memory; this just avoids regrowth copies.
     let (log, ends) = (Vec::with_capacity((end - start) as usize / 8), Vec::with_capacity((end - start) as usize / 128));
-    let mut sc = Scan::<L> { log, ends, last: vec![NO; n], dk: vec![NO; n], early: Vec::new(), found: Vec::new(), first: 0 };
+    let mut sc = Scan::<L> { log, ends, st: vec![(NO, NO); n], early: Vec::new(), found: Vec::new(), first: 0 };
     let mut f = File::open(path).unwrap();
     // Begin one byte early and drop the first (partial) line, so a line that
     // starts exactly at `start` is kept.
@@ -209,15 +212,14 @@ fn index_range<L: Copy + Default + TryFrom<u32> + Into<u32>>(path: &Path, start:
     }
     let mut dense = 0;
     sl.bm = (0..n)
-        .map(|t| if sc.dk[t] != NO || sl.off[t + 1] as usize * 32 >= nd.max(1) { (dense, dense += 1).0 } else { NO })
+        .map(|t| if sc.st[t].1 != NO || sl.off[t + 1] as usize * 32 >= nd.max(1) { (dense, dense += 1).0 } else { NO })
         .collect();
     for t in 0..n {
         sl.off[t + 1] = sl.off[t] + if sl.bm[t] == NO { sl.off[t + 1] } else { 0 };
     }
     (sl.bits, sl.ids) = (vec![0; dense as usize * sl.w], vec![0; sl.off[n] as usize]);
-    for (t, &k) in sc.dk.iter().enumerate().filter(|d| *d.1 != NO) {
-        let e = &sc.early[k as usize];
-        sl.bits[sl.bm[t] as usize * sl.w..][..e.len()].copy_from_slice(e);
+    for (t, &(_, k)) in sc.st.iter().enumerate().filter(|d| d.1.1 != NO) {
+        sl.bits[sl.bm[t] as usize * sl.w..][..sl.w].copy_from_slice(&sc.early[k as usize * EW..][..sl.w]);
     }
     // `off[t]` serves as term t's write cursor, then shifts back into place.
     let mut s = 0;
@@ -331,27 +333,28 @@ fn index_lines<L: Copy + Default + TryFrom<u32> + Into<u32>>(
                 // The doc's terms, in tight loops apart from the lexer.
                 let li = sc.ends.len();
                 for &bid in bids.iter().filter(|&&b| b != NO) {
-                    let k = sc.dk[bid as usize] as usize;
-                    if k != NO as usize {
-                        let v = &mut sc.early[k];
-                        if v.len() <= li / 64 {
-                            v.resize(li / 64 + 1, 0);
-                        }
-                        v[li / 64] |= 1 << (li % 64);
-                    } else if sc.last[bid as usize] != doc {
-                        sc.last[bid as usize] = doc;
+                    let st = &mut sc.st[bid as usize];
+                    if st.0 == doc {
+                        continue;
+                    }
+                    st.0 = doc;
+                    if st.1 != NO {
+                        sc.early[st.1 as usize * EW + li / 64] |= 1 << (li % 64);
+                    } else {
                         sc.log.push(L::try_from(bid).unwrap_or_default());
                     }
                 }
                 sc.ends.push(sc.log.len() as u32);
                 if sc.ends.len() == PROBE {
                     // Terms already in 1/16 of the docs go straight to bitmaps.
-                    let mut cnt = vec![0u32; sc.last.len()];
+                    let mut cnt = vec![0u32; sc.st.len()];
                     sc.log.iter().for_each(|&b| cnt[b.into() as usize] += 1);
+                    let mut k = 0;
                     for (t, _) in cnt.iter().enumerate().filter(|c| *c.1 as usize * 16 >= PROBE) {
-                        sc.dk[t] = sc.early.len() as u32;
-                        sc.early.push(Vec::new());
+                        (sc.st[t].1, k) = (k, k + 1);
                     }
+                    // Untouched words cost no memory.
+                    sc.early = vec![0; k as usize * EW];
                 }
                 for j in 1..seq.len() {
                     let (k, h) = pair(seq[j - 1], seq[j]);
