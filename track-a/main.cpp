@@ -11,27 +11,7 @@
 using namespace std;
 typedef uint32_t u32; typedef uint64_t u64; typedef int64_t i64; typedef uint16_t u16;
 
-static i64 days_from_civil(i64 y, unsigned m, unsigned d) {
-  y -= m <= 2;
-  i64 era = (y >= 0 ? y : y - 399) / 400;
-  unsigned yoe = (unsigned)(y - era * 400);
-  unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  return era * 146097 + (i64)doe - 719468;
-}
-static void civil_from_days(i64 z, i64& y, unsigned& m, unsigned& d) {
-  z += 719468;
-  i64 era = (z >= 0 ? z : z - 146096) / 146097;
-  unsigned doe = (unsigned)(z - era * 146097);
-  unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-  unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-  unsigned mp = (5 * doy + 2) / 153;
-  d = doy - (153 * mp + 2) / 5 + 1;
-  m = mp < 10 ? mp + 3 : mp - 9;
-  y = yoe + era * 400 + (m <= 2);
-}
-
-constexpr u64 CH = 512 << 10;     // bytes per work chunk
+constexpr u64 CH = 128 << 10;     // bytes per work chunk
 constexpr size_t HRS = 72;        // the span is fixed: 72 hours from 2026-10-30T18:00Z
 constexpr u32 BLK = 640, BSZ = 4096; // one 4 KiB page: 640 latencies (u32) then 640 metas (u16: endpoint id | is5xx << 15)
 
@@ -53,11 +33,6 @@ static inline u64 hash_ep(const char* p, u32 n) {
 struct Slot { u64 h; u32 id; };
 struct Tab {   // per-thread endpoint dictionary
   vector<Slot> s{4096}; vector<char> arena; vector<u32> off; vector<u16> len; u64 mask = 4095;
-  void grow() {
-    vector<Slot> n(s.size() * 2); u64 m = n.size() - 1;
-    for (auto& x : s) if (x.h) { u64 i = (x.h >> 20) & m; while (n[i].h) i = (i + 1) & m; n[i] = x; }
-    s.swap(n); mask = m;
-  }
   inline u32 find(const char* p, u32 l) {
     u64 h = hash_ep(p, l);
     for (u64 i = (h >> 20) & mask;; i = (i + 1) & mask) {
@@ -65,7 +40,7 @@ struct Tab {   // per-thread endpoint dictionary
       if (x.h == h) return x.id;
       if (!x.h) {
         u32 id = off.size(); off.push_back(arena.size()); len.push_back(l); arena.insert(arena.end(), p, p + l);
-        x = {h, id}; if (off.size() * 2 > s.size()) grow(); return id;
+        x = {h, id}; return id;
       }
     }
   }
@@ -111,13 +86,11 @@ static void select3(u32* v, u64 n, const u64 r[3], u32 out[3]) {
 }
 
 
-int main(int argc, char** argv) {
+int main() {
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);   // exact 4 KiB accounting, no 2 MiB surprises
-  const char* data = "/data/requests.log"; const char* outp = "/out/summary.txt";
-  for (int i = 1; i + 1 < argc; i++) { if (!strcmp(argv[i], "--data")) data = argv[++i]; else if (!strcmp(argv[i], "--out")) outp = argv[++i]; }
-  int fd = open(data, O_RDONLY); struct stat sb; if (fd < 0 || fstat(fd, &sb)) return 1;
+  int fd = open("/data/requests.log", O_RDONLY); struct stat sb; if (fd < 0 || fstat(fd, &sb)) return 1;
   u64 fz = sb.st_size;
-  int ofd = open(outp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  int ofd = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (!fz) return 0;
 
   unsigned T = 12; { cpu_set_t c; if (!sched_getaffinity(0, sizeof c, &c)) T = min<int>(T, max(1, CPU_COUNT(&c))); }
@@ -129,7 +102,6 @@ int main(int argc, char** argv) {
   char* pool = (char*)mmap(nullptr, maxBlocks * BSZ, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   atomic<u32> pn{0};
   vector<TS> ts(T);
-  const i64 baseEH = days_from_civil(2026, 10, 30) * 24 + 18;
 
   vector<vector<char>> bufs(T);
   // ---- 1. parse ----
@@ -151,9 +123,9 @@ int main(int argc, char** argv) {
     while (p < lim) {
       u64 key = rd(p + 5);                                       // "MM-DDTHH"
       if (key != ck) {
-        unsigned mo = (p[5] - '0') * 10 + p[6] - '0', da = (p[8] - '0') * 10 + p[9] - '0', hh = (p[11] - '0') * 10 + p[12] - '0';
-        i64 y = (p[0] - '0') * 1000 + (p[1] - '0') * 100 + (p[2] - '0') * 10 + p[3] - '0';
-        i64 h = days_from_civil(y, mo, da) * 24 + hh - baseEH; ch = h < 0 ? 0 : h >= (i64)HRS ? HRS - 1 : (u32)h; ck = key;
+        unsigned day = p[6] == '0' ? p[9] - '0' : p[9] - '1' + 2, hh = (p[11] - '0') * 10 + p[12] - '0';
+        ch = std::min<unsigned>(day * 24 + hh - 18, HRS - 1);
+        ck = key;
       }
       const char* m = p + 28;                                    // method: 3..7 bytes then a space
       u64 y8 = rd(m) ^ 0x2020202020202020ull;
@@ -178,8 +150,8 @@ int main(int argc, char** argv) {
   vector<vector<u32>> remap(T);
   for (unsigned t = 0; t < T; ++t) for (size_t i = 0; i < ts[t].tab.off.size(); ++i)
     remap[t].push_back(lower_bound(names.begin(), names.end(), string_view(ts[t].tab.arena.data() + ts[t].tab.off[i], ts[t].tab.len[i])) - names.begin());
-  char hs[HRS][24];
-  for (size_t h = 0; h < HRS; ++h) { i64 y; unsigned mo, da; i64 eh = baseEH + h; civil_from_days(eh / 24, y, mo, da); snprintf(hs[h], 24, "%04lld-%02u-%02uT%02u:00:00Z ", (long long)y, mo, da, (unsigned)(eh % 24)); }
+  char hs[HRS][24]; const char* date[4] = {"2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"};
+  for (size_t h = 0; h < HRS; ++h) snprintf(hs[h], 24, "%sT%02u:00:00Z ", date[(h + 18) / 24], (unsigned)(h + 18) % 24);
 
   // ---- 3. one task per hour: counting sort by endpoint rank, percentiles, text; output released in hour order ----
   vector<string> outs(HRS); vector<char> ready(HRS, 0); size_t nextw = 0; mutex mu;
@@ -202,8 +174,14 @@ int main(int argc, char** argv) {
     each([&](unsigned t, char* b, u32 n) {
       const u32* rm = remap[t].data(); const u32* lt = (const u32*)b; const u16* mt = (const u16*)(b + BLK * 4);
       for (u32 i = 0; i < n; ++i) lat[pos[rm[mt[i] & 0x7fff]]++] = lt[i];
-      madvise(b, BSZ, MADV_DONTNEED);
     });
+    thread_local vector<char*> pg; pg.clear();       // give the consumed pages back in runs: one madvise per run, not per page
+    each([&](unsigned, char* b, u32) { pg.push_back(b); });
+    sort(pg.begin(), pg.end());
+    for (size_t i = 0, j; i < pg.size(); i = j) {
+      for (j = i + 1; j < pg.size() && pg[j] == pg[j - 1] + BSZ; ++j) {}
+      madvise(pg[i], (j - i) * BSZ, MADV_DONTNEED);
+    }
     string o; o.reserve(tot * 2 + 4096); char buf[512]; u32 start = 0;
     for (size_t r = 0; r < E; ++r) {
       u64 n = cn[r]; if (!n) continue;
@@ -213,10 +191,6 @@ int main(int argc, char** argv) {
       if (n <= 16) {
         for (u64 i = 1; i < n; ++i) { u32 x = v[i]; u64 j = i; while (j && v[j - 1] > x) { v[j] = v[j - 1]; --j; } v[j] = x; }
         a = v[i50]; b = v[i95]; c = v[i99];
-      } else if (n < 48) {
-        nth_element(v, v + i50, v + n); a = v[i50];
-        if (i95 == i50) b = a; else { nth_element(v + i50 + 1, v + i95, v + n); b = v[i95]; }
-        if (i99 == i95) c = b; else { nth_element(v + i95 + 1, v + i99, v + n); c = v[i99]; }
       } else { u64 rr[3] = {i50, i95, i99}; u32 o3[3]; select3(v, n, rr, o3); a = o3[0]; b = o3[1]; c = o3[2]; }
       u64 er_ = er[r]; char* w = buf;
       memcpy(w, hs[h], 21); w += 21; memcpy(w, names[r].data(), names[r].size()); w += names[r].size();

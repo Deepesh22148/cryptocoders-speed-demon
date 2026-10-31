@@ -1,6 +1,7 @@
 #include <bits/stdc++.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 using namespace std;
@@ -100,13 +101,12 @@ int main(){
     else F(u,k*bk,min(n,(k+1)*bk))F(i,off[0][u],off[0][u+1])f(E3{{(u32)u,adj[0][i].to,adj[0][i].w}});
   };
   vector<size_t>C(NC*B),bs(B+1);
-  F(d,0,2){
+  auto build=[&](int d){
     fill(C.begin(),C.end(),0);
     dyn(NC,[&](size_t k){each(d,k,[&](const E3&e){++C[k*B+(e.a[d]>>SH)];});});
     size_t r=0; F(b,0,B){bs[b]=r;F(k,0,NC){size_t c=C[k*B+b];C[k*B+b]=r;r+=c;}} bs[B]=E=r;
     E3*tmp=new E3[E+1];
-    dyn(NC,[&](size_t k){each(d,k,[&](const E3&e){tmp[C[k*B+(e.a[d]>>SH)]++]=e;});});
-    if(!d){P.clear();P.shrink_to_fit();}
+    dyn(NC,[&](size_t k){each(d,k,[&](const E3&e){tmp[C[k*B+(e.a[d]>>SH)]++]=e;});if(!d)vector<E3>().swap(P[k]);});
     off[d]=(u32*)malloc((n+1)*4); adj[d]=(Edge*)malloc((E+1)*8); off[d][n]=E;
     dyn(B,[&](size_t b){
       size_t lo=b<<SH,hi=min(n,(b+1)<<SH),i0=bs[b],i1=bs[b+1];
@@ -114,9 +114,12 @@ int main(){
       F(i,i0,i1)++c[tmp[i].a[d]-lo];
       u32 r=i0; F(j,0,c.size()){u32 x=c[j];off[d][lo+j]=r;c[j]=r;r+=x;}
       F(i,i0,i1){auto&e=tmp[i];adj[d][c[e.a[d]-lo]++]={e.a[1-d],e.a[2]};}
+      uintptr_t p0=((uintptr_t)(tmp+i0)+4095)&~4095ul,p1=(uintptr_t)(tmp+i1)&~4095ul;
+      if(p1>p0)madvise((void*)p0,p1-p0,MADV_DONTNEED); // hand the consumed edge pages back to the OS
     });
     delete[]tmp;
-  }
+  };
+  build(0); build(1);
 
   vector<u32>nid;
   {
@@ -150,15 +153,21 @@ int main(){
       for(auto&q:L)ord.insert(ord.end(),q.begin(),q.end());
       size_t bt=(n+NT-1)/NT; nid.resize(n);
       par(NT,[&](unsigned k){F(i,k*bt,min(n,(k+1)*bt))nid[ord[i]]=i;});
-      F(d,0,2){
-        u32*no=(u32*)malloc((n+1)*4); Edge*na=(Edge*)malloc((E+1)*8); no[0]=0;
-        par(NT,[&](unsigned k){F(i,k*bt,min(n,(k+1)*bt))no[i+1]=off[d][ord[i]+1]-off[d][ord[i]];});
-        F(i,0,n)no[i+1]+=no[i];
-        par(NT,[&](unsigned k){
-          F(i,k*bt,min(n,(k+1)*bt)){u32 w=no[i],o=ord[i];F(j,off[d][o],off[d][o+1])na[w++]={nid[adj[d][j].to],adj[d][j].w};}
-        });
-        free(off[d]);free(adj[d]);off[d]=no;adj[d]=na;
-      }
+      free(off[1]);free(adj[1]); // the reverse arrays are rebuilt from the relabelled forward ones
+      u32*no=(u32*)malloc((n+1)*4); Edge*na=(Edge*)malloc((E+1)*8); no[0]=0;
+      par(NT,[&](unsigned k){F(i,k*bt,min(n,(k+1)*bt))no[i+1]=off[0][ord[i]+1]-off[0][ord[i]];});
+      F(i,0,n)no[i+1]+=no[i];
+      par(NT,[&](unsigned k){
+        size_t lo=k*bt,hi=min(n,lo+bt);
+        F(i,lo,hi){
+          if(i+16<hi)__builtin_prefetch(off[0]+ord[i+16]);
+          if(i+8<hi)__builtin_prefetch(adj[0]+off[0][ord[i+8]]);
+          u32 w=no[i],o=ord[i];
+          F(j,off[0][o],off[0][o+1]){__builtin_prefetch(nid.data()+adj[0][j].to);na[w++]={nid[adj[0][j].to],adj[0][j].w};}
+        }
+      });
+      free(off[0]);free(adj[0]);off[0]=no;adj[0]=na;
+      build(1);
     }
   }
 
