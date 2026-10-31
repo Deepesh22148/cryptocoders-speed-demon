@@ -9,11 +9,11 @@ The task, the input files and the exact output format are in the [spec](https://
 
 The steps, in order:
 
-1. **Regions.** `regions.csv` becomes a flat `Vec<u16>` indexed by `region_id`. Countries are numbered in sorted order and `_UNMATCHED` takes the last number, so the output needs no sort.
-2. **Split the file.** `records.csv` is cut into one byte range per hardware thread. A cut moves forward to the next LF followed by a digit or a BOM. Inside quotes an LF only occurs in notes, which are lowercase words (spec 2.2), so that pattern is always a record start.
-3. **Stream and parse.** Each thread reads its range in 1 MB chunks and runs a byte-level parser that follows spec 2.1: BOM only at a record start, quoted fields end at a `"` that is not part of `""`, CRLF or LF terminators, an optional missing terminator at end of file. When a chunk ends mid-record the parser stops and the thread reads more.
-4. **Aggregate.** Count, id sum, amount sum/min/max in integer cents, and name/note byte lengths (raw length minus the number of `""` escapes) per group. Distinct names: the raw quoted bytes map one to one to the unescaped value, so each thread interns them to ids and sets a bit per group.
-5. **Merge.** Thread name ids are mapped to global ids, the per-group bitsets are OR'ed, and the distinct count is a popcount.
+1. **Regions.** `regions.csv` becomes a flat `u8` table indexed by `region_id` (1 MB). Countries are numbered in sorted order and `_UNMATCHED` takes the last number, so the output needs no sort.
+2. **Split the file.** `records.csv` is cut into one byte range per hardware thread. A cut moves forward to the next LF followed by a digit or a BOM. Inside quotes an LF only occurs in notes, which are lowercase words (spec 2.2), so that pattern always marks a record start.
+3. **Stream and parse.** Each thread streams its range through one fixed 64 KB buffer. The parser follows spec 2.1 byte for byte (BOM only at a record start, `""` escapes, CRLF or LF, an optional missing final terminator) and finds quotes and commas eight bytes at a time (SWAR). When the buffer ends mid-record, the tail moves to the front and the thread reads more.
+4. **Aggregate.** Count, id sum, and amount sum/min/max in integer cents. Name and note byte counts are the raw length minus the number of `""` escapes. Each thread keeps its own 241 aggregates.
+5. **Distinct names: one shared lock-free table.** The raw quoted bytes of a name map one to one to its unescaped value, so a 64-bit hash of them is the key. All threads share one open-addressing table of 131,072 slots, each slot holding `[hash, 256-bit group set]` (5.2 MB). A slot is claimed with a CAS and a group bit is set with `fetch_or`, after a plain load shows it is not set yet. The slot and the region entry are prefetched as soon as they are known, so their cache misses overlap the rest of the parse. The distinct count per group is a popcount over the table.
 
 ## Verification
 
@@ -27,5 +27,6 @@ None.
 
 ## With another 24 hours
 
-1. Use `memchr`-style SIMD scanning for quotes and LFs inside long notes.
-2. Profile on the board's 12-thread box to see whether reading or hashing names dominates.
+1. Profile on the board's 12-thread box. Locally the shared name table is the largest cost (cache misses), then reading.
+2. Give each name a dense id to shrink the table from 5.2 MB to about 4 MB, so it fits in cache better.
+3. Known ceiling: names are compared by a 64-bit hash, not by their bytes. With the spec's 100,000-name pool the chance of a collision is about 1e-10.

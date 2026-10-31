@@ -1,350 +1,230 @@
-use std::collections::HashMap;
 use std::fs::File;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
-use std::thread;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-// Fx-style hasher: keys are short, SipHash is overkill.
-#[derive(Default)]
-struct Fx(u64);
+const BOM: u8 = 0xEF; // first byte of EF BB BF; a record never starts with it otherwise
+const CHUNK: usize = 1 << 16;
+const SLOTS: usize = 1 << 17;
+const ONES: u64 = 0x0101_0101_0101_0101;
 
-impl Hasher for Fx {
-    fn write(&mut self, bytes: &[u8]) {
-        for c in bytes.chunks(8) {
-            let mut w = [0u8; 8];
-            w[..c.len()].copy_from_slice(c);
-            self.write_u64(u64::from_le_bytes(w));
+
+type Table = [[AtomicU64; 5]];
+type Agg = [i64; 7]; // count, id sum, amount sum, min, max, name bytes, note bytes
+
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    }
+}
+
+fn eat(b: &[u8], p: &mut usize, c: u8) -> Option<()> {
+    (*b.get(*p)? == c).then(|| *p += 1)
+}
+
+fn num(b: &[u8], p: &mut usize) -> Option<i64> {
+    let mut v = 0;
+    while b.get(*p)?.is_ascii_digit() {
+        (v, *p) = (v * 10 + (b[*p] - b'0') as i64, *p + 1);
+    }
+    Some(v)
+}
+
+// The n <= 8 bytes at i as a little-endian word, zero-padded.
+fn word(b: &[u8], i: usize, n: usize) -> u64 {
+    let w = b.get(i..i + 8).map_or_else(|| b[i..i + n].iter().rev().fold(0, |w, &c| w << 8 | c as u64), |w| u64::from_le_bytes(w.try_into().unwrap()));
+    w & u64::MAX >> (64 - 8 * n)
+}
+
+// Index of the first c at or after i, eight bytes at a time.
+fn find(b: &[u8], mut i: usize, c: u8) -> Option<usize> {
+    while i + 8 <= b.len() {
+        let x = word(b, i, 8) ^ c as u64 * ONES;
+        let m = x.wrapping_sub(ONES) & !x & ONES << 7;
+        if m != 0 {
+            return Some(i + m.trailing_zeros() as usize / 8);
         }
+        i += 8;
     }
-    fn write_u64(&mut self, w: u64) {
-        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
-    }
-    fn finish(&self) -> u64 {
-        self.0
-    }
+    b[i..].iter().position(|&x| x == c).map(|k| i + k)
 }
 
-type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
-
-const BOM: &[u8] = b"\xEF\xBB\xBF";
-const HEADER: &[u8] = b"id,name,note,region_id,amount";
-const CHUNK: usize = 1 << 20;
-
-#[derive(Clone)]
-struct Agg {
-    count: u64,
-    id_sum: u64,
-    sum: i64,
-    min: i64,
-    max: i64,
-    name_bytes: u64,
-    note_bytes: u64,
-}
-
-impl Agg {
-    fn new() -> Agg {
-        Agg { count: 0, id_sum: 0, sum: 0, min: i64::MAX, max: i64::MIN, name_bytes: 0, note_bytes: 0 }
-    }
-}
-
-// Per-thread result: aggregates per group, its own name ids, and which names each group saw.
-struct Part {
-    aggs: Vec<Agg>,
-    names: FxMap<Vec<u8>, u32>,
-    seen: Vec<Vec<u64>>,
-}
-
-// Every parser below returns None when the buffer runs out mid-record, so the caller reads more.
-fn bad(p: usize) -> ! {
-    panic!("malformed records.csv near buffer offset {p}")
-}
-
-fn digits(b: &[u8], p: &mut usize) -> Option<u64> {
-    let s = *p;
-    let mut v = 0u64;
-    loop {
-        let c = *b.get(*p)?;
-        if !c.is_ascii_digit() {
-            if *p == s {
-                bad(s)
-            }
-            return Some(v);
-        }
-        v = v * 10 + (c - b'0') as u64;
-        *p += 1;
-    }
-}
-
-fn expect(b: &[u8], p: &mut usize, c: u8) -> Option<()> {
-    if *b.get(*p)? != c {
-        bad(*p)
-    }
-    *p += 1;
-    Some(())
-}
-
-// A name or note: (start, end, number of "" escapes). The raw quoted bytes are a
-// one-to-one stand-in for the unescaped value, so they serve as the distinct key.
-fn text(b: &[u8], p: &mut usize) -> Option<(usize, usize, usize)> {
+// A text field and its comma: (raw start, raw end, unescaped length). The raw bytes map
+// one to one to the unescaped value, and "" and an empty field are both empty.
+fn text(b: &[u8], p: &mut usize) -> Option<(usize, usize, i64)> {
     if *b.get(*p)? != b'"' {
-        let s = *p;
-        *p += b[s..].iter().position(|&c| matches!(c, b',' | b'"' | b'\r' | b'\n'))?;
-        return Some((s, *p, 0));
+        let (s, e) = (*p, find(b, *p, b',')?);
+        *p = e + 1;
+        return Some((s, e, (e - s) as i64));
     }
-    let s = *p + 1;
-    let mut q = s;
-    let mut esc = 0;
+    let (s, mut e, mut esc) = (*p + 1, *p + 1, 0);
+    while {
+        e = find(b, e, b'"')?;
+        *b.get(e + 1)? == b'"'
+    } {
+        (e, esc) = (e + 2, esc + 1);
+    }
+    *p = e + 1;
+    eat(b, p, b',')?;
+    Some((s, e, (e - s - esc) as i64))
+}
+
+fn hash(b: &[u8], s: usize, e: usize) -> u64 {
+    let mut h = (e - s) as u64;
+    for i in (s..e).step_by(8) {
+        h = (h ^ word(b, i, (e - i).min(8))).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
+    }
+    (h ^ h >> 32).wrapping_mul(0xD6E8_FEB8_6659_FD93) | 1
+}
+
+fn mark(t: &Table, h: u64, g: usize) {
+    let mut i = (h >> 47) as usize;
     loop {
-        q += b[q..].iter().position(|&c| c == b'"')?;
-        if *b.get(q + 1)? == b'"' {
-            esc += 1;
-            q += 2;
-        } else {
-            *p = q + 1;
-            return Some((s, q, esc));
-        }
-    }
-}
-
-fn cents(b: &[u8], p: &mut usize) -> Option<i64> {
-    let neg = *b.get(*p)? == b'-';
-    *p += neg as usize;
-    let whole = digits(b, p)? as i64;
-    expect(b, p, b'.')?;
-    let f = b.get(*p..*p + 2)?;
-    if !f.iter().all(u8::is_ascii_digit) {
-        bad(*p)
-    }
-    *p += 2;
-    let v = whole * 100 + ((f[0] - b'0') * 10 + (f[1] - b'0')) as i64;
-    Some(if neg { -v } else { v })
-}
-
-impl Part {
-    // Parses one record at p into the aggregates; returns the offset after its terminator.
-    fn record(&mut self, b: &[u8], p: usize, region: &[u16], unmatched: usize) -> Option<usize> {
-        let mut p = p;
-        if *b.get(p)? == BOM[0] {
-            if b.get(p..p + 3)? != BOM {
-                bad(p)
+        let k = t[i][0].load(Relaxed);
+        if k == h || k == 0 && t[i][0].compare_exchange(0, h, Relaxed, Relaxed).map_or_else(|x| x == h, |_| true) {
+            let (w, bit) = (&t[i][1 + g / 64], 1 << (g % 64));
+            if w.load(Relaxed) & bit == 0 {
+                w.fetch_or(bit, Relaxed);
             }
-            p += 3;
+            return;
         }
-        let id = digits(b, &mut p)?;
-        expect(b, &mut p, b',')?;
-        let (ns, ne, nesc) = text(b, &mut p)?;
-        expect(b, &mut p, b',')?;
-        let (ts, te, tesc) = text(b, &mut p)?;
-        expect(b, &mut p, b',')?;
-        let rid = digits(b, &mut p)? as usize;
-        expect(b, &mut p, b',')?;
-        let v = cents(b, &mut p)?;
-        if *b.get(p)? == b'\r' {
-            p += 1;
-        }
-        expect(b, &mut p, b'\n')?;
-
-        let g = match region.get(rid) {
-            Some(&c) if c != u16::MAX => c as usize,
-            _ => unmatched,
-        };
-        let a = &mut self.aggs[g];
-        a.count += 1;
-        a.id_sum += id;
-        a.sum += v;
-        a.min = a.min.min(v);
-        a.max = a.max.max(v);
-        a.name_bytes += (ne - ns - nesc) as u64;
-        a.note_bytes += (te - ts - tesc) as u64;
-
-        let name = &b[ns..ne];
-        let n = match self.names.get(name) {
-            Some(&n) => n,
-            None => {
-                let n = self.names.len() as u32;
-                self.names.insert(name.to_vec(), n);
-                n
-            }
-        } as usize;
-        let s = &mut self.seen[g];
-        if s.len() <= n / 64 {
-            s.resize(n / 64 + 1, 0);
-        }
-        s[n / 64] |= 1 << (n % 64);
-        Some(p)
+        i = (i + 1) % SLOTS;
     }
 }
 
-// Streams records starting in [start, end) in 1 MB reads; the last one may run past end.
-fn scan(path: &Path, start: u64, end: u64, region: &[u16], groups: usize) -> Part {
-    let mut part = Part {
-        aggs: vec![Agg::new(); groups],
-        names: FxMap::default(),
-        seen: vec![Vec::new(); groups],
+// One record at p: returns the offset after its terminator, or None if the buffer ends first.
+// Table and region loads are prefetched early so their cache misses overlap the parsing.
+fn record(b: &[u8], mut p: usize, region: &[u8], t: &Table, aggs: &mut [Agg]) -> Option<usize> {
+    p += 3 * (*b.get(p)? == BOM) as usize;
+    let id = num(b, &mut p)?;
+    eat(b, &mut p, b',')?;
+    let (s, e, name) = text(b, &mut p)?;
+    let h = hash(b, s, e);
+    let slot = &t[(h >> 47) as usize];
+    (prefetch(&slot[0]), prefetch(&slot[4]));
+    let note = text(b, &mut p)?.2;
+    let rid = num(b, &mut p)? as usize;
+    prefetch(region.as_ptr().wrapping_add(rid));
+    eat(b, &mut p, b',')?;
+    let neg = eat(b, &mut p, b'-').is_some();
+    let whole = num(b, &mut p)?;
+    eat(b, &mut p, b'.')?;
+    let v = (whole * 100 + num(b, &mut p)?) * if neg { -1 } else { 1 };
+    let _ = eat(b, &mut p, b'\r');
+    eat(b, &mut p, b'\n')?;
+    let g = match region.get(rid) {
+        Some(&g) if g != u8::MAX => g as usize,
+        _ => aggs.len() - 1,
     };
+    let a = &mut aggs[g];
+    for (i, x) in [(0, 1), (1, id), (2, v), (5, name), (6, note)] {
+        a[i] += x;
+    }
+    (a[3], a[4]) = (a[3].min(v), a[4].max(v));
+    mark(t, h, g);
+    Some(p)
+}
+
+// Streams the records that start in [start, end) through one buffer; the last may run past end.
+fn scan(path: &str, start: u64, end: u64, region: &[u8], t: &Table, groups: usize) -> Vec<Agg> {
+    let mut aggs = vec![[0, 0, 0, i64::MAX, i64::MIN, 0, 0]; groups];
     let mut f = File::open(path).unwrap();
     f.seek(SeekFrom::Start(start)).unwrap();
-    let mut buf: Vec<u8> = Vec::with_capacity(2 * CHUNK);
-    let mut base = start; // file offset of buf[0]
-    let mut pos = 0;
-    let mut eof = false;
+    let (mut buf, mut n, mut pos, mut base) = (vec![0; CHUNK], 0, 0, start);
     while base + (pos as u64) < end {
-        match part.record(&buf, pos, region, groups - 1) {
+        match record(&buf[..n], pos, region, t, &mut aggs) {
             Some(p) => pos = p,
             None => {
-                if eof {
-                    bad(pos)
-                }
-                buf.drain(..pos);
-                base += pos as u64;
-                pos = 0;
-                let n = buf.len();
-                buf.resize(n + CHUNK, 0);
+                buf.copy_within(pos..n, 0);
+                (base, n, pos) = (base + pos as u64, n - pos, 0);
                 let got = f.read(&mut buf[n..]).unwrap();
-                buf.truncate(n + got);
                 if got == 0 {
-                    // The final record may lack its terminator.
-                    eof = true;
-                    if buf.last() != Some(&b'\n') {
-                        buf.push(b'\n');
-                    }
+                    assert!(n > 0 && buf[n - 1] != b'\n', "bad record at byte {base}");
+                    buf[n] = b'\n'; // the final record may lack its terminator
                 }
+                n += got.max(1);
             }
         }
     }
-    part
+    aggs
 }
 
 // First record start at or after `at`: an LF followed by a digit or a BOM. Inside quotes an
-// LF only occurs in notes, which are lowercase words, so it is never followed by either.
-fn boundary(path: &Path, at: u64, len: u64) -> u64 {
+// LF only occurs in notes, which are lowercase words (spec 2.2), so this is never data.
+fn boundary(path: &str, at: u64, len: u64) -> u64 {
     let mut f = File::open(path).unwrap();
     f.seek(SeekFrom::Start(at - 1)).unwrap();
     let mut w = Vec::new();
     f.take(1 << 16).read_to_end(&mut w).unwrap();
-    w.windows(2)
-        .position(|x| x[0] == b'\n' && (x[1].is_ascii_digit() || x[1] == BOM[0]))
-        .map_or(len, |i| at + i as u64)
+    let start = |x: &[u8]| x[0] == b'\n' && (x[1].is_ascii_digit() || x[1] == BOM);
+    w.windows(2).position(start).map_or(len, |i| at + i as u64)
 }
 
 fn money(c: i64) -> String {
     let sign = if c < 0 { "-" } else { "" };
-    let a = c.unsigned_abs();
-    format!("{sign}{}.{:02}", a / 100, a % 100)
+    format!("{sign}{}.{:02}", c.abs() / 100, c.abs() % 100)
 }
 
 fn main() {
-    let dir = |var, default| std::env::var_os(var).map_or(default, |v| v.into_string().unwrap());
-    let data = dir("SPEED_DEMON_DATA_DIR", "/data".into());
-    let out_dir = dir("SPEED_DEMON_OUTPUT_DIR", "/out".into());
-    let threads = thread::available_parallelism().map_or(12, |n| n.get()) as u64;
+    let dir = |var, default: &str| std::env::var(var).unwrap_or(default.into());
+    let data = dir("SPEED_DEMON_DATA_DIR", "/data");
+    let out_dir = dir("SPEED_DEMON_OUTPUT_DIR", "/out");
+    let threads = std::thread::available_parallelism().map_or(12, |n| n.get()) as u64;
 
-    // regions.csv: plain lines, region ids ascending. Countries are indexed in sorted order,
-    // and _UNMATCHED takes the last index since '_' sorts after every capital letter.
-    let rtext = std::fs::read(Path::new(&data).join("regions.csv")).unwrap();
-    let mut lines = rtext.split(|&c| c == b'\n').filter(|l| !l.is_empty());
-    assert_eq!(lines.next(), Some(&b"region_id,country"[..]), "unexpected regions.csv header");
-    let rows: Vec<(usize, &[u8])> = lines
-        .map(|l| {
-            let c = l.iter().position(|&c| c == b',').unwrap();
-            (std::str::from_utf8(&l[..c]).unwrap().parse().unwrap(), &l[c + 1..])
-        })
-        .collect();
-    let mut keys: Vec<&[u8]> = rows.iter().map(|r| r.1).collect();
+    // Groups are the sorted country codes, then _UNMATCHED ('_' sorts after 'Z').
+    let rtext = std::fs::read_to_string(format!("{data}/regions.csv")).unwrap();
+    let rows: Vec<_> = rtext.lines().filter_map(|l| l.split_once(',')).collect();
+    let mut keys: Vec<&str> = rows[1..].iter().map(|r| r.1).collect();
     keys.sort_unstable();
     keys.dedup();
-    let idx: FxMap<&[u8], u16> = keys.iter().enumerate().map(|(i, &k)| (k, i as u16)).collect();
-    let mut region = vec![u16::MAX; rows.iter().map(|r| r.0 + 1).max().unwrap_or(0)];
-    for &(r, k) in &rows {
-        region[r] = idx[k];
+    let mut region = vec![u8::MAX; 1 << 20];
+    for &(r, c) in &rows[1..] {
+        let r: usize = r.parse().unwrap();
+        region.resize(region.len().max(r + 1), u8::MAX);
+        region[r] = keys.binary_search(&c).unwrap() as u8;
     }
-    keys.push(b"_UNMATCHED");
-    let groups = keys.len();
+    keys.push("_UNMATCHED");
+    assert!(keys.len() < 256, "too many countries");
 
-    // records.csv: skip the BOM and header, then split the rest at record starts.
-    let path = Path::new(&data).join("records.csv");
+    // records.csv: skip the BOM and header, then cut at record starts, one range per thread.
+    let path = format!("{data}/records.csv");
     let len = std::fs::metadata(&path).unwrap().len();
-    let mut head = Vec::new();
-    File::open(&path).unwrap().take(256).read_to_end(&mut head).unwrap();
-    let h = head.strip_prefix(BOM).unwrap_or(&head);
-    let lf = h.iter().position(|&c| c == b'\n').expect("no header terminator");
-    assert_eq!(h[..lf].strip_suffix(b"\r").unwrap_or(&h[..lf]), HEADER, "unexpected records.csv header");
-    let first = (head.len() - h.len() + lf + 1) as u64;
-    let mut cuts = vec![first];
+    let mut head = [0; 64];
+    File::open(&path).unwrap().read_exact(&mut head).unwrap();
+    let skip = 3 * (head[0] == BOM) as usize;
+    assert!(head[skip..].starts_with(b"id,name,note,region_id,amount"));
+    let mut cuts = vec![(skip + head[skip..].iter().position(|&c| c == b'\n').unwrap() + 1) as u64];
     for t in 1..threads {
-        let at = (len * t / threads).max(first + 1);
-        let b = if at >= len { len } else { boundary(&path, at, len) };
-        cuts.push(b.max(*cuts.last().unwrap()));
+        let at = (len * t / threads).max(cuts[0] + 1);
+        cuts.push(boundary(&path, at, len).max(cuts[cuts.len() - 1]));
     }
     cuts.push(len);
 
-    let parts: Vec<Part> = thread::scope(|s| {
-        let hs: Vec<_> = cuts
-            .windows(2)
-            .map(|w| {
-                let (path, region) = (&path, &region);
-                s.spawn(move || scan(path, w[0], w[1], region, groups))
-            })
-            .collect();
+    let table: Vec<[AtomicU64; 5]> = (0..SLOTS).map(|_| Default::default()).collect();
+    let parts: Vec<Vec<Agg>> = std::thread::scope(|s| {
+        let hs: Vec<_> = cuts.windows(2).map(|w| s.spawn(|| scan(&path, w[0], w[1], &region, &table, keys.len()))).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Merge: map each thread's name ids to global ones, then OR the per-group bitsets.
-    let mut aggs = vec![Agg::new(); groups];
-    let mut global: FxMap<&[u8], u32> = FxMap::default();
-    let mut seen: Vec<Vec<u64>> = vec![Vec::new(); groups];
-    for part in &parts {
-        let mut map = vec![0u32; part.names.len()];
-        for (k, &v) in &part.names {
-            let n = global.len() as u32;
-            map[v as usize] = *global.entry(k.as_slice()).or_insert(n);
-        }
-        for g in 0..groups {
-            let (a, b) = (&mut aggs[g], &part.aggs[g]);
-            a.count += b.count;
-            a.id_sum += b.id_sum;
-            a.sum += b.sum;
-            a.min = a.min.min(b.min);
-            a.max = a.max.max(b.max);
-            a.name_bytes += b.name_bytes;
-            a.note_bytes += b.note_bytes;
-            let s = &mut seen[g];
-            for (w, &bits) in part.seen[g].iter().enumerate() {
-                let mut bits = bits;
-                while bits != 0 {
-                    let n = map[w * 64 + bits.trailing_zeros() as usize] as usize;
-                    bits &= bits - 1;
-                    if s.len() <= n / 64 {
-                        s.resize(n / 64 + 1, 0);
-                    }
-                    s[n / 64] |= 1 << (n % 64);
-                }
-            }
+    let mut distinct = [0; 256];
+    for (w, word) in table.iter().flat_map(|slot| slot[1..].iter().enumerate()) {
+        let mut bits = word.load(Relaxed);
+        while bits != 0 {
+            distinct[w * 64 + bits.trailing_zeros() as usize] += 1;
+            bits &= bits - 1;
         }
     }
-
     let mut out = Vec::new();
-    for (g, a) in aggs.iter().enumerate() {
-        if a.count == 0 {
-            continue;
+    for (g, key) in keys.iter().enumerate() {
+        let sum = |i| parts.iter().map(|p| p[g][i]).sum::<i64>();
+        let min = parts.iter().map(|p| p[g][3]).min().unwrap();
+        let max = parts.iter().map(|p| p[g][4]).max().unwrap();
+        if sum(0) > 0 {
+            let (n, ids, total, nb, tb, d) = (sum(0), sum(1), money(sum(2)), sum(5), sum(6), distinct[g]);
+            let (min, max) = (money(min), money(max));
+            writeln!(out, "{key} {n} {ids} {total} {min} {max} {d} {nb} {tb}").unwrap();
         }
-        let distinct: u32 = seen[g].iter().map(|w| w.count_ones()).sum();
-        out.extend_from_slice(keys[g]);
-        writeln!(
-            out,
-            " {} {} {} {} {} {} {} {}",
-            a.count,
-            a.id_sum,
-            money(a.sum),
-            money(a.min),
-            money(a.max),
-            distinct,
-            a.name_bytes,
-            a.note_bytes
-        )
-        .unwrap();
     }
     std::fs::create_dir_all(&out_dir).unwrap();
-    std::fs::write(Path::new(&out_dir).join("aggregates.txt"), out).unwrap();
+    std::fs::write(format!("{out_dir}/aggregates.txt"), out).unwrap();
 }
