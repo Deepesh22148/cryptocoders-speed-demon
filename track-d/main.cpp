@@ -37,27 +37,56 @@ struct Heap{ // 4-ary min-heap, lazy deletion
   }
 };
 
-struct Sc{u64*L[2];vector<u32>T[2];Heap h[2];}; // label = dist+1, 0 = unlabeled
+// Open-addressing label table: key = node id, value = dist+1 (0 = unlabeled).
+struct Slot{u32 k;u32 pad;u64 v;};           // k==~0u means empty
+struct HT{
+  vector<Slot> s; size_t cnt=0,mask=0;
+  HT(){init(1<<12);}
+  void init(size_t c){s.assign(c,Slot{~0u,0,0});mask=c-1;cnt=0;}
+  size_t ix(u32 x)const{return (size_t)(((u64)x*0x9E3779B97F4A7C15ULL)>>32)&mask;}
+  u64 get(u32 x)const{
+    for(size_t i=ix(x);;i=(i+1)&mask){
+      if(s[i].k==x)return s[i].v;
+      if(s[i].k==~0u)return 0;
+    }
+  }
+  u64&at(u32 x){                              // inserts with value 0 if new; reference valid until next at()
+    if((cnt+1)*2>s.size())grow();
+    for(size_t i=ix(x);;i=(i+1)&mask){
+      if(s[i].k==x)return s[i].v;
+      if(s[i].k==~0u){s[i].k=x;++cnt;return s[i].v;}
+    }
+  }
+  void grow(){
+    vector<Slot>o; o.swap(s); init(o.size()*2);
+    for(auto&e:o)if(e.k!=~0u)at(e.k)=e.v;
+  }
+  void clear(){
+    if(s.size()>(1<<15))init(1<<12);
+    else{fill(s.begin(),s.end(),Slot{~0u,0,0});cnt=0;}
+  }
+};
+
+struct Sc{HT L[2];Heap h[2];};
 
 static long long solve(Sc&S,u32 s,u32 t){
   if(s==t)return 0;
   if(off[0][s]==off[0][s+1]||off[1][t]==off[1][t+1])return -1;
   u64 mu=~0ULL; u32 st[2]={s,t};
-  for(int d=0;d<2;++d){S.h[d].a.clear();S.L[d][st[d]]=1;S.T[d].push_back(st[d]);S.h[d].push({0,st[d]});}
+  for(int d=0;d<2;++d){S.h[d].a.clear();S.L[d].at(st[d])=1;S.h[d].push({0,st[d]});}
   while(!S.h[0].a.empty()&&!S.h[1].a.empty()&&S.h[0].a[0].k+S.h[1].a[0].k<mu){
     int d=S.h[0].a.size()<=S.h[1].a.size()?0:1;
     Heap&h=S.h[d]; Ent e=h.a[0]; h.pop();
-    u64*me=S.L[d],*ot=S.L[d^1]; const Edge*A=adj[d];
-    u32 i0=off[d][e.v],i1=off[d][e.v+1];
-    for(u32 i=i0;i<i1;++i){__builtin_prefetch(me+A[i].to);__builtin_prefetch(ot+A[i].to);}
-    for(u32 i=i0;i<i1;++i){
-      u32 v=A[i].to; u64 nd=e.k+A[i].w,c=nd+1,cur=me[v];
-      if(!cur||c<cur){if(!cur)S.T[d].push_back(v);me[v]=c;h.push({nd,v});}
-      if(ot[v])mu=min(mu,nd+ot[v]-1);
+    HT&me=S.L[d],&ot=S.L[d^1]; const Edge*A=adj[d];
+    for(u32 i=off[d][e.v];i<off[d][e.v+1];++i){
+      u32 v=A[i].to; u64 nd=e.k+A[i].w,c=nd+1;
+      u64&cur=me.at(v);
+      if(!cur||c<cur){cur=c;h.push({nd,v});}
+      u64 o=ot.get(v); if(o)mu=min(mu,nd+o-1);
     }
-    while(!h.a.empty()&&me[h.a[0].v]<h.a[0].k+1)h.pop(); // keep the top valid
+    while(!h.a.empty()&&me.get(h.a[0].v)<h.a[0].k+1)h.pop(); // keep the top valid
   }
-  for(int d=0;d<2;++d){for(u32 v:S.T[d])S.L[d][v]=0;S.T[d].clear();}
+  S.L[0].clear();S.L[1].clear();
   return mu==~0ULL?-1:(long long)mu;
 }
 
@@ -159,11 +188,10 @@ int main(){
   vector<long long>ans(Q.size()); vector<u32>od(Q.size()); iota(od.begin(),od.end(),0);
   sort(od.begin(),od.end(),[&](u32 a,u32 b){return Q[a].first<Q[b].first;});
   vector<u32>().swap(nid);
-  // Sorted queries are handed out in big contiguous chunks (each thread then touches a compact slice of its
-  // label arrays), shrinking towards the end so the threads finish together.
+  // Sorted queries are handed out in big contiguous chunks, shrinking towards the end so the threads finish together.
   size_t N=Q.size(); atomic<size_t>nx{0};
   par(min<size_t>(NT,max<size_t>(1,N)),[&](unsigned){
-    Sc S; S.L[0]=(u64*)calloc(n,8); S.L[1]=(u64*)calloc(n,8);
+    Sc S; // per-thread hash-table labels, no n-sized arrays
     for(size_t i=nx;i<N;i=nx){
       size_t c=i<N*2/3?(3*N+4*NT-1)/(4*NT):max<size_t>(2,(N-i)/(2*NT));
       if(!nx.compare_exchange_weak(i,i+c))continue;
