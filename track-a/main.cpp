@@ -1,4 +1,5 @@
-// Track A v4: the file is in arrival order, so an hour is complete once lines two hours later have been seen.
+// Track A v5: v4 + zero-copy mmap reads + std::to_chars.
+// The file is in arrival order, so an hour is complete once lines two hours later have been seen.
 // Threads parse chunks in file order and close finished hours on the spot (sort by endpoint, percentiles, text),
 // recycling the record pages. If an hour ever receives a line after it was closed, the run restarts in safe mode.
 #include <bits/stdc++.h>
@@ -11,7 +12,8 @@
 using namespace std;
 typedef uint32_t u32; typedef uint64_t u64; typedef uint16_t u16; typedef uint8_t u8;
 
-constexpr u64 CH = 64 << 10;                 // bytes per work chunk
+constexpr unsigned TMAX = 12;                // thread cap: set to your winner from the 12 / 8 / 6 test
+constexpr u64 CH = 64 << 10;                 // bytes per work chunk: set to your winner from the chunk-size test
 constexpr size_t HRS = 72, MAXE = 4096;       // the span is 72 hours from 2026-10-30T18:00Z; 1842 endpoints
 constexpr u32 BLK = 640, BSZ = 4096;          // one page: 640 latencies (u32) then 640 metas (u16: endpoint | is5xx << 15)
 
@@ -66,13 +68,7 @@ static inline u64 parse_num(const char*& q) {   // decimal up to 10 digits, SWAR
   t = (t * 100 + (t >> 16)) & 0x0000FFFF0000FFFFull;
   return (t * 10000 + (t >> 32)) & 0xFFFFFFFFull;
 }
-static const char* D2 = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
-static inline char* wu(char* o, u64 x) {
-  char t[20]; char* e = t + 20; char* p = e;
-  while (x >= 100) { u64 q = x / 100; memcpy(p -= 2, D2 + 2 * (x - q * 100), 2); x = q; }
-  if (x >= 10) memcpy(p -= 2, D2 + 2 * x, 2); else *--p = '0' + x;
-  size_t n = e - p; memcpy(o, p, n); return o + n;
-}
+static inline char* wu(char* o, u64 x) { return to_chars(o, o + 20, x).ptr; }
 
 // Exact p50/p95/p99 of a large group without sorting it: histogram on a log-scale key (16 sub-buckets per octave),
 // then nth_element only inside the (at most three) buckets that hold the wanted ranks.
@@ -96,7 +92,12 @@ int main(int argc, char** argv) {
   u64 fz = sb.st_size;
   int ofd = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (!fz) return 0;
-  unsigned T = 12; { cpu_set_t c; if (!sched_getaffinity(0, sizeof c, &c)) T = min<int>(T, max(1, CPU_COUNT(&c))); }
+  unsigned T = TMAX; { cpu_set_t c; if (!sched_getaffinity(0, sizeof c, &c)) T = min<int>(T, max(1, CPU_COUNT(&c))); }
+
+  // The whole file is mapped once and chunks are parsed in place. Only chunks within 64 bytes of the end of the
+  // file are copied into a zero-padded buffer, because the parser reads a few bytes past a line.
+  const char* fmap = (const char*)mmap(nullptr, fz, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (fmap == MAP_FAILED) fmap = nullptr;
 
   const size_t NC = (fz + CH - 1) / CH, maxBlocks = fz / 40 / BLK + HRS * T + 16;   // a line is >= 40 bytes
   char* pool = (char*)mmap(nullptr, maxBlocks * BSZ, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -116,11 +117,19 @@ int main(int argc, char** argv) {
   auto parse = [&](unsigned t, size_t k) {
     TS& st = ts[t];
     u64 r0 = k * CH, r1 = min(fz, r0 + CH), e = min(fz, r1 + 256), s = k ? r0 - 1 : 0; size_t len = e - s;
-    vector<char>& bf = bufs[t]; if (bf.size() < CH + 1 + 256 + 64) bf.resize(CH + 1 + 256 + 64);
-    for (size_t o = 0; o < len;) { ssize_t r = pread(fd, bf.data() + o, len - o, s + o); if (r <= 0) break; o += r; }
-    memset(bf.data() + len, 0, 64);
-    const char* p = bf.data(); const char* lim = p + (r1 - s);
-    if (k) p = (const char*)memchr(p, '\n', 256 + CH) + 1;     // first line starting at or after r0
+    const char* p0;
+    if (fmap && e + 64 <= fz) {
+      p0 = fmap + s;                                              // zero-copy: read straight from the page cache
+      uintptr_t a = (uintptr_t)p0 & ~(uintptr_t)4095, z = ((uintptr_t)p0 + len + 4095) & ~(uintptr_t)4095;
+      madvise((void*)a, z - a, 22);                               // MADV_POPULATE_READ: map this chunk's pages in one go (ignored if unsupported)
+    } else {
+      vector<char>& bf = bufs[t]; if (bf.size() < CH + 1 + 256 + 64) bf.resize(CH + 1 + 256 + 64);
+      for (size_t o = 0; o < len;) { ssize_t r = pread(fd, bf.data() + o, len - o, s + o); if (r <= 0) break; o += r; }
+      memset(bf.data() + len, 0, 64);
+      p0 = bf.data();
+    }
+    const char* p = p0; const char* lim = p0 + (r1 - s);
+    if (k) p = (const char*)memchr(p0, '\n', len) + 1;           // first line starting at or after r0
     u64 ck = ~0ull, cntl = 0; u32 ch = 0, mx = 0;
     const __m128i sp = _mm_set1_epi8(' ');
     while (p < lim) {
