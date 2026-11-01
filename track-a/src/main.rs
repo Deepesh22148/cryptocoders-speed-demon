@@ -1,53 +1,53 @@
 //! Track A (Ingest): per (hour, endpoint) count, nearest-rank p50/p95/p99, 5xx errors.
 //!
-//! Pipeline: 12 threads each parse a newline-aligned slice of the file into compact
-//! (key, latency) records -> merge endpoint dictionaries and sort them bytewise ->
-//! counting-sort latencies by group id -> select percentiles -> one write.
-//! Group id = hour * E + endpoint_rank, so ascending group id IS the required output order.
+//! Phase 1 (12 threads, dynamic 1 MB chunks of an mmap'd file): one forward pass per line,
+//!   fixed-offset hour, SWAR space scan fused with endpoint hashing, one u64 record pushed
+//!   into a per-thread, per-hour bucket. No line splitting, no copies, no date parsing.
+//! Merge (tiny): endpoint dictionaries are unified and sorted bytewise once.
+//! Phase 2 (12 threads, dynamic, one hour per work item): counting-sort that hour's records
+//!   by endpoint rank in an L2-resident scratch array, select the percentiles, format the
+//!   text. Iterating ranks in order yields the required output order.
+//! Phase 3: every hour block is written to its file offset in parallel with pwrite.
 
 use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 const THREADS: usize = 12; // 6 P-cores x 2 hardware threads
-const BLOCK: usize = 1 << 20; // pread block size
-const TABLE: usize = 1 << 14; // interner slots (1,842 endpoints -> load ~0.11)
+const CHUNK: usize = 1 << 20;
+const TABLE: usize = 1 << 13; // interner slots; the catalogue has 1,842 endpoints
 const HOURS: usize = 72;
+const LOW: u64 = 0x0101_0101_0101_0101;
 
-fn hash(b: &[u8]) -> u64 {
-    let mut h = 0x9E37_79B9_7F4A_7C15 ^ b.len() as u64;
-    for c in b.chunks(8) {
-        let mut w = [0u8; 8];
-        w[..c.len()].copy_from_slice(c);
-        h = (h.rotate_left(5) ^ u64::from_le_bytes(w)).wrapping_mul(0x517C_C1B7_2722_0A95);
-    }
-    h ^ (h >> 32)
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
 }
 
-/// Open-addressing byte-string -> dense id table (slot value 0 = empty, else id + 1).
+type Name = &'static [u8];
+
+/// Open-addressing endpoint table; slot value 0 = empty, else entry index + 1.
 struct Interner {
     slots: Vec<u32>,
-    hashes: Vec<u64>,
-    names: Vec<Box<[u8]>>,
+    entries: Vec<(u64, Name)>,
 }
 
 impl Interner {
     fn new() -> Self {
-        Interner { slots: vec![0; TABLE], hashes: Vec::new(), names: Vec::new() }
+        Interner { slots: vec![0; TABLE], entries: Vec::new() }
     }
-    fn intern(&mut self, key: &[u8]) -> u32 {
-        let h = hash(key);
+    fn intern(&mut self, h: u64, key: Name) -> u32 {
         let mut i = h as usize & (TABLE - 1);
         loop {
             let s = self.slots[i];
             if s == 0 {
-                self.names.push(key.into());
-                self.hashes.push(h);
-                self.slots[i] = self.names.len() as u32;
-                return self.names.len() as u32 - 1;
+                self.entries.push((h, key));
+                self.slots[i] = self.entries.len() as u32;
+                return self.entries.len() as u32 - 1;
             }
-            let id = (s - 1) as usize;
-            if self.hashes[id] == h && *self.names[id] == *key {
+            let (eh, name) = self.entries[s as usize - 1];
+            if eh == h && name == key {
                 return s - 1;
             }
             i = (i + 1) & (TABLE - 1);
@@ -55,81 +55,103 @@ impl Interner {
     }
 }
 
-/// Record key layout: endpoint_local_id << 8 | hour_index << 1 | is_5xx.
-type Rec = (u32, u32);
+/// One thread's output of phase 1: its endpoint dictionary and records bucketed by hour.
+/// Record = (local_endpoint_id << 1 | is_5xx) << 32 | latency_us.
+struct Shard {
+    names: Vec<(u64, Name)>,
+    buckets: Vec<Vec<u64>>,
+}
 
-fn parse_block(data: &[u8], names: &mut Interner, recs: &mut Vec<Rec>) {
-    for line in data.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        // The timestamp is always 27 bytes, so only fixed offsets are read:
-        // "2026-MM-DDTHH:..." -> month at 5..7, day at 8..10, hour at 11..13.
-        let d = |i: usize| (line[i] - b'0') as usize;
-        let (day, hour) = (d(8) * 10 + d(9), d(11) * 10 + d(12));
-        let ord = if line[6] == b'0' { day - 30 } else { day + 1 }; // Oct 30 -> 0 ... Nov 2 -> 3
-        let h = ord * 24 + hour - 18; // 0..=71, Oct 30 18:00 is 0
-        let rest = &line[28..]; // skip "<ts> "
-        let m_end = rest.iter().position(|&b| b == b' ').unwrap();
-        let rest = &rest[m_end + 1..]; // skip "<method> "
-        let e_end = rest.iter().position(|&b| b == b' ').unwrap();
-        let rest_after = &rest[e_end + 1..]; // "<status> <latency>"
-        let err = (rest_after[0] == b'5') as u32; // only 5xx counts; 499 does not
-        let lat = rest_after[4..].iter().fold(0u64, |a, &b| a * 10 + (b - b'0') as u64) as u32;
-        let id = names.intern(&rest[..e_end]);
-        recs.push((id << 8 | (h as u32) << 1 | err, lat));
+/// Eight bytes at `p`, zero-padded past the end of the file.
+#[inline(always)]
+fn word(d: &[u8], p: usize) -> u64 {
+    match d.get(p..p + 8) {
+        Some(s) => u64::from_le_bytes(s.try_into().unwrap()),
+        None => d[p..].iter().rev().fold(0, |a, &b| a << 8 | b as u64),
     }
 }
 
-fn worker(file: &File, start: u64, end: u64) -> (Vec<Box<[u8]>>, Vec<Rec>) {
-    let mut names = Interner::new();
-    let mut recs = Vec::with_capacity(((end - start) / 60) as usize);
-    let mut buf = vec![0u8; BLOCK + 1024];
-    let (mut off, mut carry) = (start, 0usize);
-    while off < end {
-        let want = ((end - off) as usize).min(BLOCK);
-        let n = file.read_at(&mut buf[carry..carry + want], off).expect("read");
-        if n == 0 {
+/// Nonzero iff the word has a space byte; the lowest set bit marks the first one exactly.
+#[inline(always)]
+fn space_mask(w: u64) -> u64 {
+    let x = w ^ (LOW * 0x20);
+    x.wrapping_sub(LOW) & !x & (LOW * 0x80)
+}
+
+#[inline(always)]
+fn mix(h: u64, w: u64) -> u64 {
+    (h.rotate_left(29) ^ w).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// First line start at or after `pos`. Chunk c owns the lines starting in [c*CHUNK, (c+1)*CHUNK).
+fn line_start(d: &[u8], pos: usize) -> usize {
+    if pos == 0 {
+        0
+    } else if pos >= d.len() {
+        d.len()
+    } else {
+        d[pos - 1..].iter().position(|&b| b == b'\n').map_or(d.len(), |i| pos + i)
+    }
+}
+
+fn ingest(d: Name, next: &AtomicUsize) -> Shard {
+    let mut tab = Interner::new();
+    let mut buckets: Vec<Vec<u64>> = (0..HOURS).map(|_| Vec::with_capacity(4096)).collect();
+    let chunks = d.len().div_ceil(CHUNK);
+    loop {
+        let c = next.fetch_add(1, Relaxed);
+        if c >= chunks {
             break;
         }
-        off += n as u64;
-        let len = carry + n;
-        let Some(last) = buf[..len].iter().rposition(|&b| b == b'\n') else {
-            carry = len;
-            continue;
-        };
-        parse_block(&buf[..=last], &mut names, &mut recs);
-        buf.copy_within(last + 1..len, 0);
-        carry = len - last - 1;
+        let (mut p, end) = (line_start(d, c * CHUNK), line_start(d, (c + 1) * CHUNK));
+        while p < end {
+            // "2026-MM-DDTHH:..." is always 27 bytes: month digit at 6, day at 8..10, hour at 11..13.
+            let dg = |i: usize| (d[p + i] - b'0') as usize;
+            let (day, hour) = (dg(8) * 10 + dg(9), dg(11) * 10 + dg(12));
+            let ord = if d[p + 6] == b'0' { day - 30 } else { day + 1 }; // Oct 30 -> 0 .. Nov 2 -> 3
+            let h = ord * 24 + hour - 18; // 0..=71
+            p += 28;
+            p += (space_mask(word(d, p)).trailing_zeros() / 8) as usize + 1; // skip method
+            let start = p;
+            let mut hash = 0x243F_6A88_85A3_08D3;
+            loop {
+                let w = word(d, p);
+                let m = space_mask(w);
+                if m == 0 {
+                    hash = mix(hash, w);
+                    p += 8;
+                } else {
+                    let k = (m.trailing_zeros() / 8) as usize;
+                    hash = mix(hash, w & ((1u64 << (8 * k)) - 1));
+                    p += k;
+                    break;
+                }
+            }
+            let id = tab.intern(hash ^ (hash >> 32), &d[start..p]);
+            p += 1;
+            let err = (d[p] == b'5') as u32; // only 5xx counts; 499 does not
+            p += 4;
+            let mut lat = 0u64;
+            while d[p] != b'\n' {
+                lat = lat * 10 + (d[p] - b'0') as u64;
+                p += 1;
+            }
+            p += 1;
+            buckets[h].push(((id << 1 | err) as u64) << 32 | lat);
+        }
     }
-    (names.names, recs)
+    Shard { names: tab.entries, buckets }
 }
 
-/// First line start at or after `pos`, so every thread's range begins on a line.
-fn line_start_at_or_after(file: &File, pos: u64, total: u64) -> u64 {
-    if pos == 0 {
-        return 0;
-    }
-    if pos >= total {
-        return total;
-    }
-    let (mut p, mut b) = (pos - 1, [0u8; 4096]);
-    loop {
-        let n = file.read_at(&mut b, p).expect("read");
-        if n == 0 {
-            return total;
-        }
-        if let Some(i) = b[..n].iter().position(|&c| c == b'\n') {
-            return p + i as u64 + 1;
-        }
-        p += n as u64;
-    }
-}
-
-/// Nearest-rank p50/p95/p99 by selection; a finished selection bounds the next one.
+/// Nearest-rank p50/p95/p99. Small groups sort; large ones run three nested selections,
+/// each bounded by the previous one.
 fn percentiles(s: &mut [u32]) -> [u32; 3] {
     let n = s.len();
     let rank = |p: usize| (p * n + 99) / 100; // 1-indexed ceil(p*n/100)
+    if n <= 24 {
+        s.sort_unstable();
+        return [s[rank(50) - 1], s[rank(95) - 1], s[rank(99) - 1]];
+    }
     let (mut end, mut last) = (n, (0usize, 0u32));
     let mut out = [0u32; 3];
     for (slot, p) in [(2, 99), (1, 95), (0, 50)] {
@@ -157,79 +179,120 @@ fn push_u(out: &mut Vec<u8>, mut v: u64) {
     out.extend_from_slice(&t[i..]);
 }
 
+/// Phase 2 worker: takes hours off the shared counter and renders each one's lines.
+fn render(next: &AtomicUsize, shards: &[Shard], ranks: &[Vec<u32>], names: &[Name], hours: &[String]) -> Vec<(usize, Vec<u8>)> {
+    let e = names.len();
+    let (mut cnt, mut cur, mut errs) = (vec![0u32; e + 1], vec![0u32; e], vec![0u32; e]);
+    let (mut lat, mut done) = (Vec::new(), Vec::new());
+    loop {
+        let h = next.fetch_add(1, Relaxed);
+        if h >= HOURS {
+            return done;
+        }
+        cnt.fill(0);
+        errs.fill(0);
+        for (s, rk) in shards.iter().zip(ranks) {
+            for &r in &s.buckets[h] {
+                let k = (r >> 32) as usize;
+                let g = rk[k >> 1] as usize;
+                cnt[g + 1] += 1;
+                errs[g] += (k & 1) as u32;
+            }
+        }
+        for g in 0..e {
+            cnt[g + 1] += cnt[g];
+        }
+        cur.copy_from_slice(&cnt[..e]);
+        lat.clear();
+        lat.resize(cnt[e] as usize, 0u32);
+        for (s, rk) in shards.iter().zip(ranks) {
+            for &r in &s.buckets[h] {
+                let g = rk[(r >> 33) as usize] as usize;
+                lat[cur[g] as usize] = r as u32;
+                cur[g] += 1;
+            }
+        }
+        let mut out = Vec::with_capacity(cnt[e] as usize * 4 + 4096);
+        for g in 0..e {
+            let (a, b) = (cnt[g] as usize, cnt[g + 1] as usize);
+            if a == b {
+                continue;
+            }
+            let p = percentiles(&mut lat[a..b]);
+            let count = (b - a) as u64;
+            out.extend_from_slice(hours[h].as_bytes());
+            out.extend_from_slice(names[g]);
+            for v in [count, p[0] as u64, p[1] as u64, p[2] as u64, errs[g] as u64, errs[g] as u64 * 1_000_000 / count] {
+                out.push(b' ');
+                push_u(&mut out, v);
+            }
+            out.push(b'\n');
+        }
+        done.push((h, out));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let input = args.get(1).map_or("/data/requests.log", |s| s);
     let output = args.get(2).map_or("/out/summary.txt", |s| s);
     let file = File::open(input).expect("open input");
-    let total = file.metadata().unwrap().len();
+    let len = file.metadata().unwrap().len() as usize;
+    let out_file = File::create(output).expect("create output");
+    if len == 0 {
+        return;
+    }
+    // The mapping lives until exit, so the slice is 'static. Page-cache pages are shared, never copied.
+    let d: Name = unsafe {
+        let p = mmap(std::ptr::null_mut(), len, 1 /* PROT_READ */, 2 /* MAP_PRIVATE */, file.as_raw_fd(), 0);
+        assert!(p as isize != -1, "mmap failed");
+        std::slice::from_raw_parts(p, len)
+    };
 
-    let mut bounds: Vec<u64> =
-        (0..THREADS).map(|i| line_start_at_or_after(&file, total * i as u64 / THREADS as u64, total)).collect();
-    bounds.push(total);
-    let results: Vec<(Vec<Box<[u8]>>, Vec<Rec>)> = thread::scope(|sc| {
-        let hs: Vec<_> = (0..THREADS).map(|i| {
-            let (f, a, b) = (&file, bounds[i], bounds[i + 1]);
-            sc.spawn(move || worker(f, a, b))
-        }).collect();
+    let next = AtomicUsize::new(0);
+    let shards: Vec<Shard> = thread::scope(|sc| {
+        let hs: Vec<_> = (0..THREADS).map(|_| sc.spawn(|| ingest(d, &next))).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // Global endpoint order: bytewise, proper prefix first (Vec<u8> ordering is exactly that).
-    let mut all: Vec<&[u8]> = results.iter().flat_map(|(n, _)| n.iter().map(|b| &**b)).collect();
-    all.sort_unstable();
-    all.dedup();
-    let e = all.len();
-    let ranks: Vec<Vec<u32>> = results.iter()
-        .map(|(n, _)| n.iter().map(|b| all.binary_search(&&**b).unwrap() as u32).collect())
-        .collect();
-    let gid = |t: usize, k: u32| ((k >> 1) & 127) as usize * e + ranks[t][(k >> 8) as usize] as usize;
-
-    // Counting sort of latencies by group id.
-    let groups = HOURS * e;
-    let mut starts = vec![0u32; groups + 1];
-    let mut errors = vec![0u32; groups];
-    for (t, (_, recs)) in results.iter().enumerate() {
-        for &(k, _) in recs {
-            let g = gid(t, k);
-            starts[g + 1] += 1;
-            errors[g] += k & 1;
-        }
+    // Unify the per-thread dictionaries, sort once bytewise (proper prefix first), map local id -> rank.
+    let mut global = Interner::new();
+    let remap: Vec<Vec<u32>> =
+        shards.iter().map(|s| s.names.iter().map(|&(h, n)| global.intern(h, n)).collect()).collect();
+    let mut order: Vec<u32> = (0..global.entries.len() as u32).collect();
+    order.sort_unstable_by_key(|&i| global.entries[i as usize].1);
+    let mut rank_of = vec![0u32; order.len()];
+    for (r, &i) in order.iter().enumerate() {
+        rank_of[i as usize] = r as u32;
     }
-    for g in 0..groups {
-        starts[g + 1] += starts[g];
-    }
-    let mut cursor = starts.clone();
-    let mut lat = vec![0u32; starts[groups] as usize];
-    for (t, (_, recs)) in results.iter().enumerate() {
-        for &(k, l) in recs {
-            let g = gid(t, k);
-            lat[cursor[g] as usize] = l;
-            cursor[g] += 1;
-        }
-    }
-
-    let hour_str: Vec<String> = (0..HOURS).map(|h| {
-        let (day, hh) = ((h + 18) / 24, (h + 18) % 24);
-        let date = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"][day];
-        format!("{date}T{hh:02}:00:00Z ")
+    let names: Vec<Name> = order.iter().map(|&i| global.entries[i as usize].1).collect();
+    let ranks: Vec<Vec<u32>> = remap.iter().map(|m| m.iter().map(|&g| rank_of[g as usize]).collect()).collect();
+    let hours: Vec<String> = (0..HOURS).map(|h| {
+        let date = ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"][(h + 18) / 24];
+        format!("{date}T{:02}:00:00Z ", (h + 18) % 24)
     }).collect();
 
-    let mut out = Vec::with_capacity(12 << 20);
-    for g in 0..groups {
-        let (a, b) = (starts[g] as usize, starts[g + 1] as usize);
-        if a == b {
-            continue;
-        }
-        let p = percentiles(&mut lat[a..b]);
-        let count = (b - a) as u64;
-        out.extend_from_slice(hour_str[g / e].as_bytes());
-        out.extend_from_slice(all[g % e]);
-        for v in [count, p[0] as u64, p[1] as u64, p[2] as u64, errors[g] as u64, errors[g] as u64 * 1_000_000 / count] {
-            out.push(b' ');
-            push_u(&mut out, v);
-        }
-        out.push(b'\n');
+    let next = AtomicUsize::new(0);
+    let parts: Vec<Vec<(usize, Vec<u8>)>> = thread::scope(|sc| {
+        let hs: Vec<_> = (0..THREADS).map(|_| sc.spawn(|| render(&next, &shards, &ranks, &names, &hours))).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut blocks = vec![Vec::new(); HOURS];
+    for (h, b) in parts.into_iter().flatten() {
+        blocks[h] = b;
     }
-    std::fs::write(output, out).expect("write output");
+    let mut offs = [0u64; HOURS];
+    for h in 1..HOURS {
+        offs[h] = offs[h - 1] + blocks[h - 1].len() as u64;
+    }
+    thread::scope(|sc| {
+        for t in 0..THREADS {
+            let (f, blocks, offs) = (&out_file, &blocks, &offs);
+            sc.spawn(move || {
+                for h in (t..HOURS).step_by(THREADS) {
+                    f.write_all_at(&blocks[h], offs[h]).expect("write");
+                }
+            });
+        }
+    });
 }
