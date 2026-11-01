@@ -1,0 +1,4 @@
+# The board box is an i5-13500 (AVX2, BMI2, POPCNT; no AVX-512). x86-64-v3 is
+# named explicitly rather than "native", so it builds the same anywhere.
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
