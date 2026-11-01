@@ -24,16 +24,38 @@ These were measured on the real seed-1 `full` data (`docs.txt` sha256 `6cd46167�
 
 | Commit | Change | Effect |
 |---|---|---|
-| `f9d0ead` | Build for `x86-64-v3` (`.cargo/config.toml`) | Query phase -8%, index -3%. Without it `count_ones` is a bit-twiddling sequence, not `POPCNT`. The board box is an i5-13500, which has AVX2, BMI2 and POPCNT. The level is named explicitly, not `native`, so the Depot build is unaffected. |
-| `f9d0ead` | BOOL ids ordered by document frequency in the corpus sample; ids below `early` are bitmaps from the first doc | Removes the per-slice 1024-doc probe and its count pass. Early terms set their bit without the per-term dedupe, since setting a bit twice is harmless. Index about -3%. |
-| `f9d0ead` | Phrase pairs checked only around the rarer pid of an anchor pair | The old filter was the pair's first pid: 20.3M of 36M token pairs passed it, because common words start many anchors. |
-| `f9d0ead` | Sparse BOOL lists: first term copied, OR merges two sorted runs (`sort` instead of `sort_unstable`), AND searches the longer list for each id of the shorter | Query phase -23% (383 to 293 ms single-threaded). 233k of the 248k slice evaluations end as lists, and the first sparse term used to go through a copy, `sort_unstable` and `dedup`. |
-| `f9d0ead` | One `[start, end]` or `[bitmap, NO]` entry per term instead of `off` and `bm` | One load per term per slice. The build no longer shifts `off` back into place. |
-| `f9d0ead` | Query blocks prefetch term entries 8 queries ahead, and their lists or bitmaps 4 ahead | Query phase -5 to -8%. Even queries with an empty answer cost 0.7 µs per slice, because 12 slices of about 3 MB each do not fit in L3. |
-| `c2e25f9` | A BOOL query is one `Vec<(op, term)>`; phrases deduped by line text before parsing; 256 KB corpus sample instead of 1 MB | Parse 28 to 26 ms, then to about 15 ms with the smaller sample. Parse runs on one thread, so it is wall time. |
-| `c2e25f9` | Query blocks sized to four per thread | 12 threads used to get 49 blocks of 1024, and the 49th ran alone. Now they get 48 blocks of 1042. |
+| `e6edf79` | Build for `x86-64-v3` (`.cargo/config.toml`) | Query phase -8%, index -3%. Without it `count_ones` is a bit-twiddling sequence, not `POPCNT`. The board box is an i5-13500, which has AVX2, BMI2 and POPCNT. The level is named explicitly, not `native`, so the Depot build is unaffected. |
+| `e6edf79` | BOOL ids ordered by document frequency in the corpus sample; ids below `early` are bitmaps from the first doc | Removes the per-slice 1024-doc probe and its count pass. Early terms set their bit without the per-term dedupe, since setting a bit twice is harmless. Index about -3%. |
+| `e6edf79` | Phrase pairs checked only around the rarer pid of an anchor pair | The old filter was the pair's first pid: 20.3M of 36M token pairs passed it, because common words start many anchors. |
+| `e6edf79` | Sparse BOOL lists: first term copied, OR merges two sorted runs (`sort` instead of `sort_unstable`), AND searches the longer list for each id of the shorter | Query phase -23% (383 to 293 ms single-threaded). 233k of the 248k slice evaluations end as lists, and the first sparse term used to go through a copy, `sort_unstable` and `dedup`. |
+| `e6edf79` | One `[start, end]` or `[bitmap, NO]` entry per term instead of `off` and `bm` | One load per term per slice. The build no longer shifts `off` back into place. |
+| `e6edf79` | Query blocks prefetch term entries 8 queries ahead, and their lists or bitmaps 4 ahead | Query phase -5 to -8%. Even queries with an empty answer cost 0.7 µs per slice, because 12 slices of about 3 MB each do not fit in L3. |
+| `35de5ea` | A BOOL query is one `Vec<(op, term)>`; phrases deduped by line text before parsing; 256 KB corpus sample instead of 1 MB | Parse 28 to 26 ms, then to about 15 ms with the smaller sample. Parse runs on one thread, so it is wall time. |
+| `35de5ea` | Query blocks sized to four per thread | 12 threads used to get 49 blocks of 1024, and the 49th ran alone. Now they get 48 blocks of 1042. |
 
-Overall, the whole run on a 4-core laptop went from 839 to 728 ms (min of 11, interleaved) after `f9d0ead`. In Linux (Docker, 8 threads), it went from 659 to 581 ms (min of 6) after `c2e25f9`. Peak memory is unchanged at 75-95 MB.
+Overall, the whole run on a 4-core laptop went from 839 to 728 ms (min of 11, interleaved) after `e6edf79`. In Linux (Docker, 8 threads), it went from 659 to 581 ms (min of 6) after `35de5ea`. Peak memory is unchanged at 75-95 MB.
+
+## Memory
+
+Measured as `VmHWM` with 12 threads in Linux (Docker), which is steadier than the cgroup number. Before these changes, the peak was 92 MB:
+- 16 MB of parse state
+- 45 MB of final index: ids 21 MB, bitmaps 11 MB, term entries 5 MB
+- a 31 MB build transient: logs 26 MB, early bitmaps about 8 MB, dedupe state 2.5 MB
+
+Every slice builds at about the same moment, so the build is the peak.
+
+| Change | Peak RSS |
+|---|---:|
+| Before | 92 MB |
+| Each slice frees its dedupe state, and its early bitmaps once they are copied, before allocating its ids | 67-75 MB |
+| Query text and corpus sample freed after parsing (the one term over 16 bytes now owns its key); term-table keys as two `u64`s, so buckets are 24 bytes instead of 32 | 63-69 MB |
+
+The range comes from how many slices happen to build at once. Time is unchanged (interleaved A/B, medians equal).
+
+Measured and not kept:
+- An early-bitmap threshold of 1/32 was worse (73-87 MB).
+- A final bitmap threshold of 1/16 saved about 1 MB.
+- Gap-encoded ids would be only 23% smaller (varint), since most gaps are 128 or more, and every list would then need decoding at query time.
 
 ## How correctness is checked
 
@@ -88,4 +110,4 @@ Single-threaded on the laptop, a 32 MB slice takes about 185 ms:
 
 In wall time with 8 threads, parse is about 5%, the scan and build about 75%, and queries about 15%.
 
-Peak memory is mostly the scan: each slice holds its term log (2.2 MB) and its CSR ids (1.8 MB) at the same time while it builds. Removing that overlap needs an in-place transpose, which was estimated at 60 ms of extra build per slice.
+What is left of the peak is mostly the build: each slice holds its term log (2.2 MB) and its CSR ids (1.8 MB) at the same time. Removing that overlap needs an in-place transpose, which was estimated at 60 ms of extra build per slice.

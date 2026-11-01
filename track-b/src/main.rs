@@ -41,9 +41,9 @@ enum Query {
     Phrase(u32),
 }
 #[derive(Default)]
-struct Plan<'a> {
-    terms: Map<&'a [u8], (u32, u32)>,
-    short: Map<u128, (u32, u32)>,
+struct Plan {
+    terms: Map<Vec<u8>, (u32, u32)>,
+    short: Map<(u64, u64), (u32, u32)>,
     bools: u32,
     early: u32,
     pids: u32,
@@ -53,17 +53,22 @@ struct Plan<'a> {
     trig: Vec<u64>,
 }
 
-impl<'a> Plan<'a> {
+impl Plan {
     /// The (BOOL id, phrase id) entry of a term.
-    fn slot(&mut self, w: &'a [u8]) -> &mut (u32, u32) {
-        if w.len() <= 16 { self.short.entry(key(w)).or_insert((NO, NO)) } else { self.terms.entry(w).or_insert((NO, NO)) }
+    fn slot(&mut self, w: &[u8]) -> &mut (u32, u32) {
+        if w.len() <= 16 { self.short.entry(key(w)).or_insert((NO, NO)) } else { self.terms.entry(w.to_vec()).or_insert((NO, NO)) }
     }
 }
 
 /// A term of up to 16 bytes packed into a u128, lowercased (alphanumeric bytes
 /// OR 0x20 are their lowercase).
-fn key(w: &[u8]) -> u128 {
-    w.iter().rev().fold(0, |k, &c| k << 8 | (c | 0x20) as u128)
+fn key(w: &[u8]) -> (u64, u64) {
+    halves(w.iter().rev().fold(0, |k, &c| k << 8 | (c | 0x20) as u128))
+}
+
+/// A packed key as two u64s: 8-aligned, so a table bucket is 24 bytes, not 32.
+fn halves(k: u128) -> (u64, u64) {
+    (k as u64, (k >> 64) as u64)
 }
 
 fn pair(a: u32, b: u32) -> (u64, usize) {
@@ -94,7 +99,7 @@ struct Scan<L> {
 // Bitmap words per early term: a slice holds at most 65536 docs.
 const EW: usize = 1024;
 
-fn parse<'a>(input: &'a [u8], sample: &[u8]) -> (Vec<Query>, Plan<'a>) {
+fn parse(input: &[u8], sample: &[u8]) -> (Vec<Query>, Plan) {
     let (mut p, mut queries, mut seen) = (Plan::default(), Vec::with_capacity(input.len() / 30), Map::default());
     p.short.reserve(input.len() / 20);
     let (mut bools, mut pids) = (0, 0);
@@ -229,10 +234,15 @@ fn index_range<L: Copy + Default + TryFrom<u32> + Into<u32>>(path: &Path, start:
             (*e, at) = ([at, at], at + e[1]);
         }
     }
-    (sl.bits, sl.ids) = (vec![0; dense as usize * sl.w], vec![0; at as usize]);
+    // Peak memory is this build, with every slice at once: free the scan's own
+    // state before the ids exist.
+    sc.st = Vec::new();
+    sl.bits = vec![0; dense as usize * sl.w];
     for t in 0..p.early as usize {
         sl.bits[t * sl.w..][..sl.w].copy_from_slice(&sc.early[t * EW..][..sl.w]);
     }
+    sc.early = Vec::new();
+    sl.ids = vec![0; at as usize];
     let mut s = 0;
     for (li, &e) in sc.ends.iter().enumerate() {
         for &b in &sc.log[s..e as usize] {
@@ -329,7 +339,7 @@ fn index_lines<L: Copy + Default + TryFrom<u32> + Into<u32>>(
                 let t = match e - s {
                     l @ ..=16 => {
                         let raw = u128::from_le_bytes(text[s..s + 16].try_into().unwrap());
-                        p.short.get(&((raw | 0x2020_2020_2020_2020_2020_2020_2020_2020) & (!0 >> (128 - 8 * l))))
+                        p.short.get(&halves((raw | 0x2020_2020_2020_2020_2020_2020_2020_2020) & (!0 >> (128 - 8 * l))))
                     }
                     ..=32 => p.terms.get(&text[s..e].iter().map(|b| b | 0x20).collect::<Vec<u8>>()[..]),
                     _ => None,
@@ -484,6 +494,7 @@ fn main() {
     let mut sample = vec![0; 1 << 18];
     let got = File::open(&path).unwrap().read(&mut sample).unwrap();
     let (qs, plan) = parse(&qtext, &sample[..got]);
+    drop((qtext, sample));
 
     // One slice per thread (each query visits every slice, so more cost query
     // time); at least 8 keep each one's doc count within u16 local indexes.
