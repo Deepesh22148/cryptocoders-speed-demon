@@ -18,6 +18,23 @@ The public board feed keeps only each team's best and latest run, so earlier run
 
 `5760c1a` was slower. Each query visits every slice, so doubling the slices doubled the scattered per-slice lookups in the query phase. `c1dc498` goes back to one slice per thread, and `e645618` answers queries in blocks of 1024, slice by slice, so each slice's index stays cache-hot.
 
+## Local measurements since `e645618`
+
+These were measured on the real seed-1 `full` data (`docs.txt` sha256 `6cd46167…`), with the output checked against the published `results.txt` hash (`f86973c2…`) and the `sample` hash (`eeeec1e9…`) after every step. The board rows follow once the commits are pushed.
+
+| Commit | Change | Effect |
+|---|---|---|
+| `f9d0ead` | Build for `x86-64-v3` (`.cargo/config.toml`) | Query phase -8%, index -3%. Without it `count_ones` is a bit-twiddling sequence, not `POPCNT`. The board box is an i5-13500, which has AVX2, BMI2 and POPCNT. The level is named explicitly, not `native`, so the Depot build is unaffected. |
+| `f9d0ead` | BOOL ids ordered by document frequency in the corpus sample; ids below `early` are bitmaps from the first doc | Removes the per-slice 1024-doc probe and its count pass. Early terms set their bit without the per-term dedupe, since setting a bit twice is harmless. Index about -3%. |
+| `f9d0ead` | Phrase pairs checked only around the rarer pid of an anchor pair | The old filter was the pair's first pid: 20.3M of 36M token pairs passed it, because common words start many anchors. |
+| `f9d0ead` | Sparse BOOL lists: first term copied, OR merges two sorted runs (`sort` instead of `sort_unstable`), AND searches the longer list for each id of the shorter | Query phase -23% (383 to 293 ms single-threaded). 233k of the 248k slice evaluations end as lists, and the first sparse term used to go through a copy, `sort_unstable` and `dedup`. |
+| `f9d0ead` | One `[start, end]` or `[bitmap, NO]` entry per term instead of `off` and `bm` | One load per term per slice. The build no longer shifts `off` back into place. |
+| `f9d0ead` | Query blocks prefetch term entries 8 queries ahead, and their lists or bitmaps 4 ahead | Query phase -5 to -8%. Even queries with an empty answer cost 0.7 µs per slice, because 12 slices of about 3 MB each do not fit in L3. |
+| `c2e25f9` | A BOOL query is one `Vec<(op, term)>`; phrases deduped by line text before parsing; 256 KB corpus sample instead of 1 MB | Parse 28 to 26 ms, then to about 15 ms with the smaller sample. Parse runs on one thread, so it is wall time. |
+| `c2e25f9` | Query blocks sized to four per thread | 12 threads used to get 49 blocks of 1024, and the 49th ran alone. Now they get 48 blocks of 1042. |
+
+Overall, the whole run on a 4-core laptop went from 839 to 728 ms (min of 11, interleaved) after `f9d0ead`. In Linux (Docker, 8 threads), it went from 659 to 581 ms (min of 6) after `c2e25f9`. Peak memory is unchanged at 75-95 MB.
+
 ## How correctness is checked
 
 The organisers' generator was not run locally. Instead, a generator written from `specs/b-index.md` produces 250,000 docs (255 MB) and 50,000 queries. It follows:
@@ -40,7 +57,7 @@ Local timings come from a 4-core laptop, and they swing about 40% between identi
 - **Lexing.** A byte loop took 2.6 ns/byte single-threaded. SSE2 masks walked with `trailing_zeros` take 0.45 ns/byte.
 - **Term lookup.** It looked expensive (37 ns per token). The cause was a variable-length `copy_from_slice` that compiled to a `memcpy` call per token. A fixed 16-byte load plus a mask brought it to about 11 ns, close to the cost of a hash probe.
 - **Hasher.** The first Fx-style hasher returned `word * K`. Its low bits, which pick the hashbrown bucket, depended only on the first letters. A folded 128-bit multiply fixes that.
-- **Phrases.** Keeping positions cost about 1 s of indexing, and re-scanning document text cost 10.9 GB of re-lexing on phrases made only of common words. Matching phrases during the scan removes both. Each phrase is keyed by its rarest adjacent pair, measured on a 1 MB sample, behind a 1M-bit filter, and verified on the doc's term-id buffer.
+- **Phrases.** Keeping positions cost about 1 s of indexing, and re-scanning document text cost 10.9 GB of re-lexing on phrases made only of common words. Matching phrases during the scan removes both. Each phrase is keyed by its rarest adjacent pair, measured on a corpus sample (now 256 KB), behind a 1M-bit filter, and verified on the doc's term-id buffer.
 - **Postings.** Growing one vector per term meant about 2.4M reallocations. An append-only log per slice, counting-sorted once into CSR, removed them. Terms that are common in a slice become bitmaps.
 - **Memory** (cgroup `memory.peak`; `/data` is pre-warmed outside the cgroup, so reading the corpus is free). The changes were:
   - streaming instead of holding the 255 MB file
@@ -55,3 +72,20 @@ Local timings come from a 4-core laptop, and they swing about 40% between identi
 - **A direct-mapped cache in front of the term table, a custom linear-probing table, and separate maps for keys of up to 8 bytes.** All were as slow as hashbrown or slower in an in-memory microbenchmark.
 - **Batching term lookups for memory-level parallelism.** Only 5% faster in the microbenchmark, so not worth the code.
 - **Two slices per thread.** See above.
+- **24-byte term-table buckets** (key as two `u64`s instead of a 16-aligned `u128`, so 3 MB instead of 4 MB). No measurable change.
+- **Early bitmaps laid out block-major** (each 64-doc block's words for all early terms together, transposed at build). It was faster single-threaded and slower with 8 threads, and peak memory did not move, so it was not worth the transpose.
+- **`target-cpu=alderlake` instead of `x86-64-v3`.** Same speed.
+- **A 1/32 early-bitmap threshold instead of 1/16.** Peak memory did not move.
+- **Evaluating BOOL queries during the scan, with no postings at all.** This was not built. The 31,000 BOOL answers hold 88M documents in total, so the per-document evaluations would cost more time than the memory they save is worth.
+
+## Where the time goes now
+
+Single-threaded on the laptop, a 32 MB slice takes about 185 ms:
+- lexing and reading, 43 ms
+- term lookups, 68 ms (about 15 ns per token, mostly hashbrown probes)
+- per-doc BOOL bookkeeping, 48 ms
+- the phrase loop, 21 ms
+
+In wall time with 8 threads, parse is about 5%, the scan and build about 75%, and queries about 15%.
+
+Peak memory is mostly the scan: each slice holds its term log (2.2 MB) and its CSR ids (1.8 MB) at the same time while it builds. Removing that overlap needs an in-place transpose, which was estimated at 60 ms of extra build per slice.
