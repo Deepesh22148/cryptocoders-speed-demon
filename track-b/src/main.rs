@@ -33,8 +33,6 @@ impl Hasher for Fx {
 
 type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
 const NO: u32 = u32::MAX;
-// Docs per slice scanned before its common terms switch to direct bitmaps.
-const PROBE: usize = 1024;
 
 enum Query {
     Bool(Vec<u32>, Vec<u8>),
@@ -43,19 +41,24 @@ enum Query {
 
 /// Everything known from the queries before the corpus is read. A term maps to
 /// (BOOL posting id, phrase term id), keyed by its packed bytes (`short`, built
-/// the same way by the scan) when up to 16 bytes long, else by its bytes. Phrases
-/// are pid sequences found during the scan through `pairs`: each phrase is keyed
-/// by its rarest adjacent pid pair in a corpus sample, mapping to (phrase id, pair
-/// offset). `bloom` is a bit filter over those pairs.
+/// the same way by the scan) when up to 16 bytes long, else by its bytes. BOOL ids
+/// are ordered by document frequency in a corpus sample; ids below `early` are
+/// common enough to be bitmaps from the start. Phrases are pid sequences found
+/// during the scan through `pairs`: each phrase is keyed by its rarest adjacent
+/// pid pair in the sample, mapping to (phrase id, pair offset). `bloom` is a bit
+/// filter over those pairs, and `trig` holds the rarer pid of each, so the scan
+/// only checks the pairs around a token in `trig`.
 #[derive(Default)]
 struct Plan<'a> {
     terms: Map<&'a [u8], (u32, u32)>,
     short: Map<u128, (u32, u32)>,
     bools: u32,
+    early: u32,
     pids: u32,
     phrases: Vec<Vec<u32>>,
     pairs: Map<u64, Vec<(u32, usize)>>,
     bloom: Vec<u64>,
+    trig: Vec<u64>,
 }
 
 impl<'a> Plan<'a> {
@@ -77,30 +80,30 @@ fn pair(a: u32, b: u32) -> (u64, usize) {
 }
 
 /// Results for one byte range of the corpus, which holds docs `first..`
-/// (ranges are disjoint and ascending, so they are never merged). A common BOOL
-/// term has bitmap `bm[t]` (`w` words in `bits`) over local doc indexes; any
-/// other term has the sorted local indexes `ids[off[t]..off[t + 1]]`. Phrase `q`
-/// matches docs `hits[hoff[q]..hoff[q + 1]]`.
+/// (ranges are disjoint and ascending, so they are never merged). BOOL term t
+/// has entry `ent[t]`, one load either way: `[k, NO]` for a common term with
+/// bitmap k (`w` words in `bits`) over local doc indexes, else `[a, b]` for its
+/// sorted local indexes `ids[a..b]`. Phrase `q` matches docs
+/// `hits[hoff[q]..hoff[q + 1]]`.
 #[derive(Default)]
 struct Slice {
     first: u32,
     w: usize,
-    bm: Vec<u32>,
+    ent: Vec<[u32; 2]>,
     bits: Vec<u64>,
-    off: Vec<u32>,
     ids: Vec<u16>,
     hoff: Vec<u32>,
     hits: Vec<u32>,
 }
 
 /// Scan state of a slice: each doc's new BOOL term ids go to `log` (ending at
-/// `ends[i]`), except for terms already common in the first `PROBE` docs, which
-/// set bits in bitmap `st[t].1` of `early` (`EW` words each) directly. `st[t].0`
-/// is the last doc that held term t. `found` collects (phrase, doc) matches.
+/// `ends[i]`), except for early terms, which set bits in their bitmap in `early`
+/// (`EW` words each) directly. `st[t]` is the last doc that held term t. `found`
+/// collects (phrase, doc) matches.
 struct Scan<L> {
     log: Vec<L>,
     ends: Vec<u32>,
-    st: Vec<(u32, u32)>,
+    st: Vec<u32>,
     early: Vec<u64>,
     found: Vec<(u32, u32)>,
     first: u32,
@@ -147,19 +150,41 @@ fn parse<'a>(input: &'a [u8], sample: &[u8]) -> (Vec<Query>, Plan<'a>) {
     }
     (p.bools, p.pids) = (bools, pids);
     // Phrase term frequencies in a corpus sample pick each phrase's rarest pair.
-    let mut freq = vec![0u64; p.pids as usize];
-    for w in sample.split(|b| !b.is_ascii_alphanumeric()).filter(|w| (1..=16).contains(&w.len())) {
-        match p.short.get(&key(w)) {
-            Some(&(_, pid)) if pid != NO => freq[pid as usize] += 1,
-            _ => {}
+    let (mut freq, mut df, mut last, mut docs) = (vec![0u64; pids as usize], vec![0u32; bools as usize], vec![NO; bools as usize], 0);
+    for (d, line) in sample.split(|&b| b == b'\n').enumerate() {
+        docs = d + 1;
+        for w in line.split(|b| !b.is_ascii_alphanumeric()).filter(|w| (1..=16).contains(&w.len())) {
+            let Some(&(bid, pid)) = p.short.get(&key(w)) else { continue };
+            if pid != NO {
+                freq[pid as usize] += 1;
+            }
+            if bid != NO && last[bid as usize] != d as u32 {
+                (last[bid as usize], df[bid as usize]) = (d as u32, df[bid as usize] + 1);
+            }
         }
     }
-    p.bloom = vec![0; 1 << 14];
+    // Renumber BOOL ids by sample df: terms in 1/16 of the docs start as bitmaps,
+    // and the scan's per-term state for the rest stays cache-friendly.
+    let mut order: Vec<u32> = (0..bools).collect();
+    order.sort_by_key(|&b| std::cmp::Reverse(df[b as usize]));
+    p.early = order.iter().take_while(|&&b| df[b as usize] as usize * 16 >= docs).count() as u32;
+    order.iter().enumerate().for_each(|(r, &b)| last[b as usize] = r as u32);
+    let remap = |t: &mut (u32, u32)| t.0 = if t.0 == NO { NO } else { last[t.0 as usize] };
+    p.short.values_mut().for_each(remap);
+    p.terms.values_mut().for_each(remap);
+    for q in &mut queries {
+        if let Query::Bool(ids, _) = q {
+            ids.iter_mut().for_each(|b| *b = last[*b as usize]);
+        }
+    }
+    (p.bloom, p.trig) = (vec![0; 1 << 14], vec![0; (pids as usize).div_ceil(64)]);
     for (n, ph) in p.phrases.iter().enumerate() {
         let a = (0..ph.len() - 1).min_by_key(|&i| (freq[ph[i] as usize] + 1) * (freq[ph[i + 1] as usize] + 1)).unwrap();
         let (k, h) = pair(ph[a], ph[a + 1]);
         p.pairs.entry(k).or_default().push((n as u32, a));
         p.bloom[h / 64] |= 1 << (h % 64);
+        let r = if freq[ph[a] as usize] <= freq[ph[a + 1] as usize] { ph[a] } else { ph[a + 1] };
+        p.trig[r as usize / 64] |= 1 << (r % 64);
     }
     (queries, p)
 }
@@ -170,7 +195,8 @@ fn index_range<L: Copy + Default + TryFrom<u32> + Into<u32>>(path: &Path, start:
     let n = p.bools as usize;
     // Untouched capacity costs no memory; this just avoids regrowth copies.
     let (log, ends) = (Vec::with_capacity((end - start) as usize / 8), Vec::with_capacity((end - start) as usize / 128));
-    let mut sc = Scan::<L> { log, ends, st: vec![(NO, NO); n], early: Vec::new(), found: Vec::new(), first: 0 };
+    let early = vec![0; p.early as usize * EW];
+    let mut sc = Scan::<L> { log, ends, st: vec![NO; n], early, found: Vec::new(), first: 0 };
     let mut f = File::open(path).unwrap();
     // Begin one byte early and drop the first (partial) line, so a line that
     // starts exactly at `start` is kept.
@@ -206,36 +232,36 @@ fn index_range<L: Copy + Default + TryFrom<u32> + Into<u32>>(path: &Path, start:
     // Common terms become bitmaps, the rest CSR lists of local doc indexes.
     let nd = sc.ends.len();
     assert!(nd <= 1 << 16, "slice too large for u16 doc indexes");
-    let mut sl = Slice { first: sc.first, w: nd.div_ceil(64), off: vec![0; n + 1], ..Default::default() };
+    let mut sl = Slice { first: sc.first, w: nd.div_ceil(64), ent: vec![[0, 0]; n], ..Default::default() };
     for &b in &sc.log {
-        sl.off[b.into() as usize + 1] += 1;
+        sl.ent[b.into() as usize][1] += 1;
     }
-    let mut dense = 0;
-    sl.bm = (0..n)
-        .map(|t| if sc.st[t].1 != NO || sl.off[t + 1] as usize * 32 >= nd.max(1) { (dense, dense += 1).0 } else { NO })
-        .collect();
-    for t in 0..n {
-        sl.off[t + 1] = sl.off[t] + if sl.bm[t] == NO { sl.off[t + 1] } else { 0 };
+    // Early terms come first, so term t < `p.early` gets bitmap t. A list's end
+    // serves as its write cursor while it fills.
+    let (mut dense, mut at) = (0, 0);
+    for (t, e) in sl.ent.iter_mut().enumerate() {
+        if t < p.early as usize || e[1] as usize * 32 >= nd.max(1) {
+            (*e, dense) = ([dense, NO], dense + 1);
+        } else {
+            (*e, at) = ([at, at], at + e[1]);
+        }
     }
-    (sl.bits, sl.ids) = (vec![0; dense as usize * sl.w], vec![0; sl.off[n] as usize]);
-    for (t, &(_, k)) in sc.st.iter().enumerate().filter(|d| d.1.1 != NO) {
-        sl.bits[sl.bm[t] as usize * sl.w..][..sl.w].copy_from_slice(&sc.early[k as usize * EW..][..sl.w]);
+    (sl.bits, sl.ids) = (vec![0; dense as usize * sl.w], vec![0; at as usize]);
+    for t in 0..p.early as usize {
+        sl.bits[t * sl.w..][..sl.w].copy_from_slice(&sc.early[t * EW..][..sl.w]);
     }
-    // `off[t]` serves as term t's write cursor, then shifts back into place.
     let mut s = 0;
     for (li, &e) in sc.ends.iter().enumerate() {
         for &b in &sc.log[s..e as usize] {
-            let (b, k) = (b.into() as usize, sl.bm[b.into() as usize] as usize);
-            if k != NO as usize {
-                sl.bits[k * sl.w + li / 64] |= 1 << (li % 64);
+            let x = &mut sl.ent[b.into() as usize];
+            if x[1] == NO {
+                sl.bits[x[0] as usize * sl.w + li / 64] |= 1 << (li % 64);
             } else {
-                (sl.ids[sl.off[b] as usize], sl.off[b]) = (li as u16, sl.off[b] + 1);
+                (sl.ids[x[1] as usize], x[1]) = (li as u16, x[1] + 1);
             }
         }
         s = e as usize;
     }
-    sl.off.rotate_right(1);
-    sl.off[0] = 0;
     // Phrase matches, grouped by phrase.
     sc.found.sort_unstable();
     sc.found.dedup();
@@ -332,38 +358,30 @@ fn index_lines<L: Copy + Default + TryFrom<u32> + Into<u32>>(
             if nl >> q & 1 == 1 {
                 // The doc's terms, in tight loops apart from the lexer.
                 let li = sc.ends.len();
-                for &bid in bids.iter().filter(|&&b| b != NO) {
-                    let st = &mut sc.st[bid as usize];
-                    if st.0 == doc {
-                        continue;
-                    }
-                    st.0 = doc;
-                    if st.1 != NO {
-                        sc.early[st.1 as usize * EW + li / 64] |= 1 << (li % 64);
-                    } else {
+                for &bid in bids.iter() {
+                    // Setting a bit twice is harmless, so early terms skip the dedupe.
+                    if bid < p.early {
+                        sc.early[bid as usize * EW + li / 64] |= 1 << (li % 64);
+                    } else if bid != NO && sc.st[bid as usize] != doc {
+                        sc.st[bid as usize] = doc;
                         sc.log.push(L::try_from(bid).unwrap_or_default());
                     }
                 }
                 sc.ends.push(sc.log.len() as u32);
-                if sc.ends.len() == PROBE {
-                    // Terms already in 1/16 of the docs go straight to bitmaps.
-                    let mut cnt = vec![0u32; sc.st.len()];
-                    sc.log.iter().for_each(|&b| cnt[b.into() as usize] += 1);
-                    let mut k = 0;
-                    for (t, _) in cnt.iter().enumerate().filter(|c| *c.1 as usize * 16 >= PROBE) {
-                        (sc.st[t].1, k) = (k, k + 1);
-                    }
-                    // Untouched words cost no memory.
-                    sc.early = vec![0; k as usize * EW];
-                }
-                for j in 1..seq.len() {
-                    let (k, h) = pair(seq[j - 1], seq[j]);
-                    if p.bloom[h / 64] >> (h % 64) & 1 == 0 {
+                for (j, &t) in seq.iter().enumerate() {
+                    if t == NO || p.trig[t as usize / 64] >> (t % 64) & 1 == 0 {
                         continue;
                     }
-                    for &(ph, a) in p.pairs.get(&k).into_iter().flatten() {
-                        if j > a && seq[j - 1 - a..].starts_with(&p.phrases[ph as usize]) {
-                            sc.found.push((ph, doc));
+                    // The pairs (i, i + 1) that hold position j.
+                    for i in j.max(1) - 1..(j + 1).min(seq.len() - 1) {
+                        let (k, h) = pair(seq[i], seq[i + 1]);
+                        if p.bloom[h / 64] >> (h % 64) & 1 == 0 {
+                            continue;
+                        }
+                        for &(ph, a) in p.pairs.get(&k).into_iter().flatten() {
+                            if i >= a && seq[i - a..].starts_with(&p.phrases[ph as usize]) {
+                                sc.found.push((ph, doc));
+                            }
                         }
                     }
                 }
@@ -384,8 +402,8 @@ fn run(s: &Slice, terms: &[u32], ops: &[u8], l: &mut Vec<u16>, r: &mut Vec<u64>)
     let (mut bits, w) = (false, s.w);
     l.clear();
     for (i, &t) in terms.iter().enumerate() {
-        let (op, k) = (if i == 0 { b'O' } else { ops[i - 1] }, s.bm[t as usize] as usize);
-        let list = &s.ids[s.off[t as usize] as usize..s.off[t as usize + 1] as usize];
+        let (op, [a, b]) = (if i == 0 { b'O' } else { ops[i - 1] }, s.ent[t as usize]);
+        let (k, list) = if b == NO { (a as usize, &[][..]) } else { (NO as usize, &s.ids[a as usize..b as usize]) };
         let has = |d: u16| s.bits[k * w + d as usize / 64] >> (d % 64) & 1 == 1;
         let inr = |r: &[u64], d: u16| r[d as usize / 64] >> (d % 64) & 1 == 1;
         match (bits, op, k != NO as usize) {
@@ -395,12 +413,19 @@ fn run(s: &Slice, terms: &[u32], ops: &[u8], l: &mut Vec<u16>, r: &mut Vec<u64>)
                 l.iter().for_each(|&d| r[d as usize / 64] |= 1 << (d % 64));
                 bits = true;
             }
+            (false, b'O', false) if l.is_empty() => l.extend_from_slice(list),
             (false, b'O', false) => {
+                // Two sorted runs: the stable sort merges them in one pass.
                 l.extend_from_slice(list);
-                l.sort_unstable();
+                l.sort();
                 l.dedup();
             }
             (false, b'A', true) => l.retain(|&d| has(d)),
+            // Intersect by searching the longer list for each id of the shorter.
+            (false, b'A', false) if list.len() < l.len() => {
+                let v: Vec<u16> = list.iter().copied().filter(|d| l.binary_search(d).is_ok()).collect();
+                *l = v;
+            }
             (false, b'A', false) => l.retain(|d| list.binary_search(d).is_ok()),
             (false, _, true) => l.retain(|&d| !has(d)),
             (false, _, false) => l.retain(|d| list.binary_search(d).is_err()),
@@ -422,6 +447,15 @@ fn run(s: &Slice, terms: &[u32], ops: &[u8], l: &mut Vec<u16>, r: &mut Vec<u64>)
         }
     }
     bits
+}
+
+fn prefetch<T>(x: &T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch is only a hint; `x` is a valid reference.
+    unsafe {
+        use std::arch::x86_64::*;
+        _mm_prefetch::<_MM_HINT_T0>(x as *const T as *const i8);
+    }
 }
 
 const MASKS: [u64; 6] = [
@@ -485,7 +519,22 @@ fn main() {
         let block = &qs[b * QB..(b * QB + QB).min(qs.len())];
         let mut acc = vec![(0, 0u64, Vec::<u64>::new()); block.len()];
         for s in &ix {
-            for (q, (count, sum, first)) in block.iter().zip(&mut acc) {
+            for (i, (q, (count, sum, first))) in block.iter().zip(&mut acc).enumerate() {
+                // Lookups are cache misses: fetch the entries 8 queries ahead and
+                // the lists or bitmaps they point to 4 ahead.
+                if let Some(Query::Bool(terms, _)) = block.get(i + 8) {
+                    terms.iter().for_each(|&t| prefetch(&s.ent[t as usize]));
+                }
+                if let Some(Query::Bool(terms, _)) = block.get(i + 4) {
+                    for &t in terms {
+                        let [a, b] = s.ent[t as usize];
+                        if b == NO {
+                            prefetch(&s.bits[a as usize * s.w]);
+                        } else if a < b {
+                            prefetch(&s.ids[a as usize]);
+                        }
+                    }
+                }
                 match q {
                     Query::Phrase(p) => {
                         let ids = &s.hits[s.hoff[*p as usize] as usize..s.hoff[*p as usize + 1] as usize];
