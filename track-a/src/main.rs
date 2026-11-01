@@ -2,18 +2,19 @@
 //!
 //! Phase 1 (12 threads, dynamic 1 MB chunks of an mmap'd file): one forward pass per line,
 //!   fixed-offset hour, SWAR space scan fused with endpoint hashing, SWAR latency parse, one
-//!   u64 record pushed into a pre-sized per-thread, per-hour bucket. No line splitting, no
+//!   6-byte record pushed into a pre-sized per-thread, per-hour bucket. No line splitting, no
 //!   copies, no date parsing.
 //! Merge (tiny): endpoint dictionaries are unified and sorted bytewise once.
 //! Phase 2 (12 threads, dynamic, one hour per work item): counting-sort that hour's records
 //!   by endpoint rank in an L2-resident scratch array, select the percentiles, format the
-//!   text. Iterating ranks in order yields the required output order.
-//! Phase 3: every hour block is written to its file offset in parallel with pwrite.
+//!   text. Iterating ranks in order yields the required output order. An hour's file offset
+//!   is the end of the previous hour, so each worker waits for that one number, writes its
+//!   block with pwrite and reuses the buffer: no output is ever held in memory.
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
 use std::thread;
 
 const THREADS: usize = 12; // 6 P-cores x 2 hardware threads
@@ -62,11 +63,19 @@ impl Interner {
     }
 }
 
+/// One request, packed to 6 bytes (3.1M of them are the bulk of the memory).
+/// `key` = local endpoint id << 1 | is_5xx.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct Rec {
+    lat: u32,
+    key: u16,
+}
+
 /// One thread's output of phase 1: its endpoint dictionary and records bucketed by hour.
-/// Record = (local_endpoint_id << 1 | is_5xx) << 32 | latency_us.
 struct Shard {
     names: Vec<(u64, Name)>,
-    buckets: Vec<Vec<u64>>,
+    buckets: Vec<Vec<Rec>>,
 }
 
 /// Eight bytes at `p`, zero-padded past the end of the file.
@@ -108,7 +117,7 @@ fn ingest(d: Name, next: &AtomicUsize) -> Shard {
     let mut tab = Interner::new();
     // ~1.7x the expected share of records per bucket; untouched pages cost neither time nor memory.
     let cap = d.len() / 40 / (THREADS * HOURS);
-    let mut buckets: Vec<Vec<u64>> = (0..HOURS).map(|_| Vec::with_capacity(cap)).collect();
+    let mut buckets: Vec<Vec<Rec>> = (0..HOURS).map(|_| Vec::with_capacity(cap)).collect();
     let chunks = d.len().div_ceil(CHUNK);
     loop {
         let c = next.fetch_add(1, Relaxed);
@@ -166,7 +175,10 @@ fn ingest(d: Name, next: &AtomicUsize) -> Shard {
                 v
             };
             p += 1;
-            buckets[h].push(((id << 1 | err) as u64) << 32 | lat);
+            buckets[h].push(Rec {
+                lat: lat as u32,
+                key: (id << 1 | err) as u16,
+            });
         }
     }
     Shard {
@@ -211,30 +223,32 @@ fn push_u(out: &mut Vec<u8>, mut v: u64) {
     out.extend_from_slice(&t[i..]);
 }
 
-/// Phase 2 worker: takes hours off the shared counter and renders each one's lines.
+/// Phase 2 worker: takes hours off the shared counter, renders each one's lines and writes
+/// them at the offset where the previous hour ended (`ends[h]` = end offset, MAX = unknown yet).
 fn render(
     next: &AtomicUsize,
     shards: &[Shard],
     ranks: &[Vec<u32>],
     names: &[Name],
     hours: &[String],
-) -> Vec<(usize, Vec<u8>)> {
+    ends: &[AtomicU64],
+    file: &File,
+) {
     let e = names.len();
     let (mut cnt, mut cur, mut errs) = (vec![0u32; e + 1], vec![0u32; e], vec![0u32; e]);
-    let (mut lat, mut done) = (Vec::new(), Vec::new());
+    let (mut lat, mut out) = (Vec::new(), Vec::new());
     loop {
         let h = next.fetch_add(1, Relaxed);
         if h >= HOURS {
-            return done;
+            return;
         }
         cnt.fill(0);
         errs.fill(0);
         for (s, rk) in shards.iter().zip(ranks) {
             for &r in &s.buckets[h] {
-                let k = (r >> 32) as usize;
-                let g = rk[k >> 1] as usize;
+                let g = rk[(r.key >> 1) as usize] as usize;
                 cnt[g + 1] += 1;
-                errs[g] += (k & 1) as u32;
+                errs[g] += (r.key & 1) as u32;
             }
         }
         for g in 0..e {
@@ -245,12 +259,12 @@ fn render(
         lat.resize(cnt[e] as usize, 0u32);
         for (s, rk) in shards.iter().zip(ranks) {
             for &r in &s.buckets[h] {
-                let g = rk[(r >> 33) as usize] as usize;
-                lat[cur[g] as usize] = r as u32;
+                let g = rk[(r.key >> 1) as usize] as usize;
+                lat[cur[g] as usize] = r.lat;
                 cur[g] += 1;
             }
         }
-        let mut out = Vec::with_capacity(cnt[e] as usize * 4 + 4096);
+        out.clear();
         for g in 0..e {
             let (a, b) = (cnt[g] as usize, cnt[g + 1] as usize);
             if a == b {
@@ -273,7 +287,20 @@ fn render(
             }
             out.push(b'\n');
         }
-        done.push((h, out));
+        // Hours are claimed in ascending order, so the one we wait on is already running.
+        let start = if h == 0 {
+            0
+        } else {
+            loop {
+                let v = ends[h - 1].load(Acquire);
+                if v != u64::MAX {
+                    break v;
+                }
+                thread::yield_now();
+            }
+        };
+        ends[h].store(start + out.len() as u64, Release);
+        file.write_all_at(&out, start).expect("write");
     }
 }
 
@@ -337,28 +364,10 @@ fn main() {
         .collect();
 
     let next = AtomicUsize::new(0);
-    let parts: Vec<Vec<(usize, Vec<u8>)>> = thread::scope(|sc| {
-        let hs: Vec<_> = (0..THREADS)
-            .map(|_| sc.spawn(|| render(&next, &shards, &ranks, &names, &hours)))
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let mut blocks = vec![Vec::new(); HOURS];
-    for (h, b) in parts.into_iter().flatten() {
-        blocks[h] = b;
-    }
-    let mut offs = [0u64; HOURS];
-    for h in 1..HOURS {
-        offs[h] = offs[h - 1] + blocks[h - 1].len() as u64;
-    }
+    let ends: Vec<AtomicU64> = (0..HOURS).map(|_| AtomicU64::new(u64::MAX)).collect();
     thread::scope(|sc| {
-        for t in 0..THREADS {
-            let (f, blocks, offs) = (&out_file, &blocks, &offs);
-            sc.spawn(move || {
-                for h in (t..HOURS).step_by(THREADS) {
-                    f.write_all_at(&blocks[h], offs[h]).expect("write");
-                }
-            });
+        for _ in 0..THREADS {
+            sc.spawn(|| render(&next, &shards, &ranks, &names, &hours, &ends, &out_file));
         }
     });
 }
