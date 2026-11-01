@@ -34,20 +34,12 @@ impl Hasher for Fx {
 type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
 const NO: u32 = u32::MAX;
 
+/// A BOOL query is its (operator, term) steps, the first one `O`R-ed into the
+/// empty set.
 enum Query {
-    Bool(Vec<u32>, Vec<u8>),
+    Bool(Vec<(u8, u32)>),
     Phrase(u32),
 }
-
-/// Everything known from the queries before the corpus is read. A term maps to
-/// (BOOL posting id, phrase term id), keyed by its packed bytes (`short`, built
-/// the same way by the scan) when up to 16 bytes long, else by its bytes. BOOL ids
-/// are ordered by document frequency in a corpus sample; ids below `early` are
-/// common enough to be bitmaps from the start. Phrases are pid sequences found
-/// during the scan through `pairs`: each phrase is keyed by its rarest adjacent
-/// pid pair in the sample, mapping to (phrase id, pair offset). `bloom` is a bit
-/// filter over those pairs, and `trig` holds the rarer pid of each, so the scan
-/// only checks the pairs around a token in `trig`.
 #[derive(Default)]
 struct Plan<'a> {
     terms: Map<&'a [u8], (u32, u32)>,
@@ -79,12 +71,6 @@ fn pair(a: u32, b: u32) -> (u64, usize) {
     (k, (k.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 44) as usize)
 }
 
-/// Results for one byte range of the corpus, which holds docs `first..`
-/// (ranges are disjoint and ascending, so they are never merged). BOOL term t
-/// has entry `ent[t]`, one load either way: `[k, NO]` for a common term with
-/// bitmap k (`w` words in `bits`) over local doc indexes, else `[a, b]` for its
-/// sorted local indexes `ids[a..b]`. Phrase `q` matches docs
-/// `hits[hoff[q]..hoff[q + 1]]`.
 #[derive(Default)]
 struct Slice {
     first: u32,
@@ -96,10 +82,6 @@ struct Slice {
     hits: Vec<u32>,
 }
 
-/// Scan state of a slice: each doc's new BOOL term ids go to `log` (ending at
-/// `ends[i]`), except for early terms, which set bits in their bitmap in `early`
-/// (`EW` words each) directly. `st[t]` is the last doc that held term t. `found`
-/// collects (phrase, doc) matches.
 struct Scan<L> {
     log: Vec<L>,
     ends: Vec<u32>,
@@ -118,31 +100,32 @@ fn parse<'a>(input: &'a [u8], sample: &[u8]) -> (Vec<Query>, Plan<'a>) {
     let (mut bools, mut pids) = (0, 0);
     for line in input.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
         if let Some(rest) = line.strip_prefix(b"BOOL ") {
-            let (mut ids, mut ops) = (Vec::with_capacity(6), Vec::with_capacity(5));
+            let (mut steps, mut op) = (Vec::with_capacity(6), b'O');
             for (i, w) in rest.split(|&b| b == b' ').enumerate() {
                 if i % 2 == 1 {
-                    ops.push(w[0]);
+                    op = w[0];
                     continue;
                 }
                 let t = p.slot(w);
                 if t.0 == NO {
                     (t.0, bools) = (bools, bools + 1);
                 }
-                ids.push(t.0);
+                steps.push((op, t.0));
             }
-            queries.push(Query::Bool(ids, ops));
+            queries.push(Query::Bool(steps));
         } else {
-            let mut ph = Vec::with_capacity(8);
-            for w in line[8..line.len() - 1].split(|&b| b == b' ') {
-                let t = p.slot(w);
-                if t.1 == NO {
-                    (t.1, pids) = (pids, pids + 1);
-                }
-                ph.push(t.1);
-            }
+            // Equal phrase lines are equal term sequences: parse each text once.
             let n = p.phrases.len() as u32;
-            let id = *seen.entry(ph.clone()).or_insert(n);
+            let id = *seen.entry(line).or_insert(n);
             if id == n {
+                let mut ph = Vec::with_capacity(8);
+                for w in line[8..line.len() - 1].split(|&b| b == b' ') {
+                    let t = p.slot(w);
+                    if t.1 == NO {
+                        (t.1, pids) = (pids, pids + 1);
+                    }
+                    ph.push(t.1);
+                }
                 p.phrases.push(ph);
             }
             queries.push(Query::Phrase(id));
@@ -173,8 +156,8 @@ fn parse<'a>(input: &'a [u8], sample: &[u8]) -> (Vec<Query>, Plan<'a>) {
     p.short.values_mut().for_each(remap);
     p.terms.values_mut().for_each(remap);
     for q in &mut queries {
-        if let Query::Bool(ids, _) = q {
-            ids.iter_mut().for_each(|b| *b = last[*b as usize]);
+        if let Query::Bool(steps) = q {
+            steps.iter_mut().for_each(|(_, b)| *b = last[*b as usize]);
         }
     }
     (p.bloom, p.trig) = (vec![0; 1 << 14], vec![0; (pids as usize).div_ceil(64)]);
@@ -398,11 +381,11 @@ fn index_lines<L: Copy + Default + TryFrom<u32> + Into<u32>>(
 /// Evaluate a BOOL query on one slice. The result is the sorted local doc
 /// indexes in `l` while only sparse terms feed it, else bitmap `r`; returns
 /// whether `r` holds it.
-fn run(s: &Slice, terms: &[u32], ops: &[u8], l: &mut Vec<u16>, r: &mut Vec<u64>) -> bool {
+fn run(s: &Slice, steps: &[(u8, u32)], l: &mut Vec<u16>, r: &mut Vec<u64>) -> bool {
     let (mut bits, w) = (false, s.w);
     l.clear();
-    for (i, &t) in terms.iter().enumerate() {
-        let (op, [a, b]) = (if i == 0 { b'O' } else { ops[i - 1] }, s.ent[t as usize]);
+    for &(op, t) in steps {
+        let [a, b] = s.ent[t as usize];
         let (k, list) = if b == NO { (a as usize, &[][..]) } else { (NO as usize, &s.ids[a as usize..b as usize]) };
         let has = |d: u16| s.bits[k * w + d as usize / 64] >> (d % 64) & 1 == 1;
         let inr = |r: &[u64], d: u16| r[d as usize / 64] >> (d % 64) & 1 == 1;
@@ -498,7 +481,7 @@ fn main() {
     let threads = thread::available_parallelism().map_or(12, |n| n.get());
     let qtext = std::fs::read(Path::new(&data).join("queries.txt")).unwrap();
     let path = Path::new(&data).join("docs.txt");
-    let mut sample = vec![0; 1 << 20];
+    let mut sample = vec![0; 1 << 18];
     let got = File::open(&path).unwrap().read(&mut sample).unwrap();
     let (qs, plan) = parse(&qtext, &sample[..got]);
 
@@ -512,21 +495,22 @@ fn main() {
     });
 
     // Threads answer blocks of queries slice by slice, so each slice's index
-    // stays cache-hot across the block.
-    const QB: usize = 1024;
-    let blocks = par(qs.len().div_ceil(QB), threads, |b| {
+    // stays cache-hot across the block. Four blocks per thread keep the threads
+    // finishing together.
+    let qb = qs.len().div_ceil(threads * 4).max(1);
+    let blocks = par(qs.len().div_ceil(qb), threads, |b| {
         let (mut buf, mut r, mut l) = (Vec::new(), Vec::new(), Vec::new());
-        let block = &qs[b * QB..(b * QB + QB).min(qs.len())];
+        let block = &qs[b * qb..(b * qb + qb).min(qs.len())];
         let mut acc = vec![(0, 0u64, Vec::<u64>::new()); block.len()];
         for s in &ix {
             for (i, (q, (count, sum, first))) in block.iter().zip(&mut acc).enumerate() {
                 // Lookups are cache misses: fetch the entries 8 queries ahead and
                 // the lists or bitmaps they point to 4 ahead.
-                if let Some(Query::Bool(terms, _)) = block.get(i + 8) {
-                    terms.iter().for_each(|&t| prefetch(&s.ent[t as usize]));
+                if let Some(Query::Bool(steps)) = block.get(i + 8) {
+                    steps.iter().for_each(|&(_, t)| prefetch(&s.ent[t as usize]));
                 }
-                if let Some(Query::Bool(terms, _)) = block.get(i + 4) {
-                    for &t in terms {
+                if let Some(Query::Bool(steps)) = block.get(i + 4) {
+                    for &(_, t) in steps {
                         let [a, b] = s.ent[t as usize];
                         if b == NO {
                             prefetch(&s.bits[a as usize * s.w]);
@@ -542,7 +526,7 @@ fn main() {
                         *sum += ids.iter().map(|&x| x as u64).sum::<u64>();
                         first.extend(ids.iter().take(10 - first.len()).map(|&x| x as u64));
                     }
-                    Query::Bool(terms, ops) if !run(s, terms, ops, &mut l, &mut r) => {
+                    Query::Bool(steps) if !run(s, steps, &mut l, &mut r) => {
                         *count += l.len() as u64;
                         *sum += l.iter().map(|&d| (s.first + d as u32) as u64).sum::<u64>();
                         first.extend(l.iter().take(10 - first.len()).map(|&d| (s.first + d as u32) as u64));
