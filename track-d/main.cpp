@@ -10,25 +10,32 @@ typedef uint32_t u32; typedef uint64_t u64;
 struct Edge{u32 to,w;};
 struct E3{u32 a[3];};
 static u32*off[2]; static Edge*adj[2];
-
 static u64 num(const char*&p,const char*e){
   while(p<e&&(unsigned)(*p-'0')>9)++p;
   u64 x=0; while(p<e&&(unsigned)(*p-'0')<=9)x=x*10+*p++-'0';
   return x;
 }
-
-// Search state is templated on the label width. u32 covers every distance below 2^32-1 (all road-network
-// queries) with half the cache footprint; the rare query that would overflow is redone with u64.
+static inline u64 rd8(const char* p) { u64 w; memcpy(&w, p, 8); return w; }
+// decimal at p (word-at-a-time for up to 7 digits, plain loop for longer numbers); p ends on the byte after it
+static inline u64 pnum(const char*& q) {
+  u64 t = rd8(q) ^ 0x3030303030303030ull;
+  u64 nd = ((t + 0x7676767676767676ull) | t) & 0x8080808080808080ull;
+  if (__builtin_expect(!nd, 0)) { u64 x = 0; for (unsigned d; (d = (unsigned char)*q - '0') < 10; ++q) x = x * 10 + d; return x; }
+  unsigned k = __builtin_ctzll(nd) >> 3; q += k;
+  t <<= (8 - k) * 8;
+  t = (t * 10 + (t >> 8)) & 0x00FF00FF00FF00FFull;
+  t = (t * 100 + (t >> 16)) & 0x0000FFFF0000FFFFull;
+  return (t * 10000 + (t >> 32)) & 0xFFFFFFFFull;
+}
 template<class L>struct Ent{L k;u32 v;};
-template<class L>struct Lb{L l[2];}; // fwd+bwd labels of one node side by side: one cache line per relaxation
-
-template<class L>struct Heap{ // monotone radix heap (keys never drop below the last extracted key), lazy deletion
+template<class L>struct Lb{L l[2];};
+template<class L>struct Heap{
   vector<Ent<L>> bk[65]; size_t sz=0; u64 last=0;
   bool empty()const{return !sz;}
   void clear(){for(auto&b:bk)b.clear();sz=0;last=0;}
   static int bi(u64 x,u64 l){return x==l?0:64-__builtin_clzll(x^l);}
   void push(Ent<L> e){bk[bi(e.k,last)].push_back(e);++sz;}
-  u64 top(){ // minimum key; makes bucket 0 hold exactly the minimum
+  u64 top(){
     if(bk[0].empty()){
       int i=1; while(bk[i].empty())++i;
       u64 m=~0ULL; for(auto&e:bk[i])m=min<u64>(m,e.k);
@@ -40,9 +47,7 @@ template<class L>struct Heap{ // monotone radix heap (keys never drop below the 
   }
   Ent<L> pop(){top(); Ent<L> e=bk[0].back(); bk[0].pop_back(); --sz; return e;}
 };
-template<class L>struct Sc{Lb<L>*lab=nullptr;vector<u32>T[2];Heap<L>h[2];}; // label = dist+1, 0 = unlabeled
-
-// Bidirectional Dijkstra. Returns -1 if unreachable, -2 if a u32 label would overflow.
+template<class L>struct Sc{Lb<L>*lab=nullptr;vector<u32>T[2];Heap<L>h[2];};
 template<class L>static long long solve(Sc<L>&S,u32 s,u32 t){
   if(s==t)return 0;
   if(off[0][s]==off[0][s+1]||off[1][t]==off[1][t+1])return -1;
@@ -68,33 +73,28 @@ template<class L>static long long solve(Sc<L>&S,u32 s,u32 t){
   if(ov)return -2;
   return mu==~0ULL?-1:(long long)mu;
 }
-
 int main(){
   unsigned NT=12;
   {cpu_set_t c; if(!sched_getaffinity(0,sizeof c,&c))NT=min<int>(NT,max(1,CPU_COUNT(&c)));}
   auto par=[&](size_t T,auto f){vector<thread>v;F(k,0,T)v.emplace_back(f,(unsigned)k);for(auto&t:v)t.join();};
   auto dyn=[&](size_t N,auto f){atomic<size_t>c{0};par(NT,[&](unsigned){size_t k;while((k=c++)<N)f(k);});};
-
   int fd=open("/data/graph.txt",O_RDONLY); struct stat sb; fstat(fd,&sb);
   u64 fz=sb.st_size; size_t n=0,NC=max<size_t>(NT,fz>>20);
   vector<vector<E3>> P(NC);
   dyn(NC,[&](size_t k){
     u64 r0=fz/NC*k,r1=k+1==NC?fz:fz/NC*(k+1),s=k?r0-1:0,e=k+1==NC?fz:min(fz,r1+256);
-    vector<char>b(e-s);
-    for(size_t o=0;o<b.size();){ssize_t r=pread(fd,b.data()+o,b.size()-o,s+o);if(r<=0)break;o+=r;}
-    const char*p=b.data(),*q=p+b.size();
+    vector<char>b(e-s+16); // zero padding: the word-at-a-time parser reads up to 8 bytes past a number
+    for(size_t o=0;o<e-s;){ssize_t r=pread(fd,b.data()+o,e-s-o,s+o);if(r<=0)break;o+=r;}
+    const char*p=b.data(),*q=p+(e-s);
     auto nxt=[&](const char*x){while(x<q&&*x!='\n')++x;return x<q?x+1:q;};
     if(!k){const char*h=p;n=num(h,q);}
     const char*a=nxt(p),*z=k+1==NC?q:nxt(p+(r1-1-s));
     P[k].reserve((z-a)/12+16);
-    for(;;){
-      while(a<z&&(unsigned)(*a-'0')>9)++a;
-      if(a>=z)break;
-      u32 u=num(a,z),v=num(a,z),w=num(a,z);
+    while(a<z){ // each line is exactly "u v w\n"
+      u32 u=pnum(a); ++a; u32 v=pnum(a); ++a; u32 w=pnum(a); ++a;
       if(u!=v)P[k].push_back({u,v,w});
     }
   });
-
   const int SH=15; size_t B=(n>>SH)+1,E=0,bk=(n+NC-1)/NC;
   auto each=[&](int d,size_t k,auto f){
     if(!d){for(auto&e:P[k])f(e);}
@@ -115,12 +115,11 @@ int main(){
       u32 r=i0; F(j,0,c.size()){u32 x=c[j];off[d][lo+j]=r;c[j]=r;r+=x;}
       F(i,i0,i1){auto&e=tmp[i];adj[d][c[e.a[d]-lo]++]={e.a[1-d],e.a[2]};}
       uintptr_t p0=((uintptr_t)(tmp+i0)+4095)&~4095ul,p1=(uintptr_t)(tmp+i1)&~4095ul;
-      if(p1>p0)madvise((void*)p0,p1-p0,MADV_DONTNEED); // hand the consumed edge pages back to the OS
+      if(p1>p0)madvise((void*)p0,p1-p0,MADV_DONTNEED);
     });
     delete[]tmp;
   };
   build(0); build(1);
-
   vector<u32>nid;
   {
     u64 nr=0,tot=0; size_t sd=max<size_t>(1,n/200000);
@@ -130,7 +129,7 @@ int main(){
     if(tot&&nr*10<tot*6&&n>1){
       vector<char>vis(n);
       auto claim=[&](u32 v){return !vis[v]&&!__atomic_exchange_n(&vis[v],1,__ATOMIC_RELAXED);};
-      auto grow=[&](vector<u32>&q){   // cell-wise growth: BFS balls of ~2048 nodes, each next ball starts at the newest boundary node
+      auto grow=[&](vector<u32>&q){
         vector<u32> Fr,lq; Fr.push_back(q[0]);
         while(!Fr.empty()){
           lq.assign(1,Fr.back()); Fr.pop_back(); size_t h=0,cnt=0;
@@ -153,7 +152,7 @@ int main(){
       for(auto&q:L)ord.insert(ord.end(),q.begin(),q.end());
       size_t bt=(n+NT-1)/NT; nid.resize(n);
       par(NT,[&](unsigned k){F(i,k*bt,min(n,(k+1)*bt))nid[ord[i]]=i;});
-      free(off[1]);free(adj[1]); // the reverse arrays are rebuilt from the relabelled forward ones
+      free(off[1]);free(adj[1]);
       u32*no=(u32*)malloc((n+1)*4); Edge*na=(Edge*)malloc((E+1)*8); no[0]=0;
       par(NT,[&](unsigned k){F(i,k*bt,min(n,(k+1)*bt))no[i+1]=off[0][ord[i]+1]-off[0][ord[i]];});
       F(i,0,n)no[i+1]+=no[i];
@@ -170,7 +169,6 @@ int main(){
       build(1);
     }
   }
-
   vector<pair<u32,u32>>Q; {ifstream f("/data/queries.txt");u32 s,t;while(f>>s>>t){if(nid.size()){s=nid[s];t=nid[t];}Q.push_back({s,t});}}
   vector<long long>ans(Q.size()); vector<u32>od(Q.size()); iota(od.begin(),od.end(),0);
   sort(od.begin(),od.end(),[&](u32 a,u32 b){return Q[a].first<Q[b].first;});
@@ -178,7 +176,7 @@ int main(){
   size_t N=Q.size(); atomic<size_t>nx{0};
   par(min<size_t>(NT,max<size_t>(1,N)),[&](unsigned){
     Sc<u32> S; S.lab=(Lb<u32>*)calloc(n,sizeof(Lb<u32>));
-    Sc<u64> W; // wide fallback, allocated only if a query needs it
+    Sc<u64> W;
     for(size_t i=nx;i<N;i=nx){
       size_t c=i<N*2/3?(3*N+4*NT-1)/(4*NT):max<size_t>(2,(N-i)/(2*NT));
       if(!nx.compare_exchange_weak(i,i+c))continue;
