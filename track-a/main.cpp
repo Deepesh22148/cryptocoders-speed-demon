@@ -32,7 +32,7 @@ static inline u64 hash_ep(const char* p, u32 n) {
 
 // Global endpoint registry: hash -> global id, plus the names in bytewise order (extended as endpoints appear).
 static mutex rm; static unordered_map<u64, u32> byHash; static char nb[MAXE][128]; static u8 nl[MAXE];
-static u32 nameCount, sortedCount; static vector<u32> order;
+static u32 nameCount, sortedCount, rankOf[MAXE]; static vector<u32> order;
 static u32 reg(u64 h, const char* p, u32 l) {
   lock_guard<mutex> g(rm); auto it = byHash.try_emplace(h, nameCount);
   if (it.second) { memcpy(nb[nameCount], p, l); nl[nameCount++] = l; }
@@ -40,14 +40,14 @@ static u32 reg(u64 h, const char* p, u32 l) {
 }
 
 struct Slot { u64 h; u32 id; };
-struct Tab {   // per-thread endpoint dictionary: name -> global id
-  vector<Slot> s{4096};
+struct Tab {   // per-thread endpoint dictionary: name -> local id, local id -> global id
+  vector<Slot> s{4096}; u32 gid[MAXE]; atomic<u32> n{0};
   inline u32 find(const char* p, u32 l) {
     u64 h = hash_ep(p, l);
     for (u64 i = (h >> 20) & 4095;; i = (i + 1) & 4095) {
       Slot& x = s[i];
       if (x.h == h) return x.id;
-      if (!x.h) { x = {h, reg(h, p, l)}; return x.id; }
+      if (!x.h) { u32 id = n; gid[id] = reg(h, p, l); x = {h, id}; n.store(id + 1, memory_order_release); return id; }
     }
   }
 };
@@ -150,7 +150,7 @@ int main(int argc, char** argv) {
 
   const char* date[4] = {"2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"};
   auto hour = [&](size_t h) {
-    thread_local vector<u32> cn, er, pos, lat;
+    thread_local vector<u32> cn, er, pos, lat; thread_local u32 rk[MAXE]; thread_local u16 rl[MAXE];
     u32 E;
     {
       lock_guard<mutex> g(rm);
@@ -159,27 +159,30 @@ int main(int argc, char** argv) {
         for (u32 x = sortedCount; x < nameCount; ++x) order.push_back(x);
         auto cmp = [](u32 a, u32 b) { return string_view(nb[a], nl[a]) < string_view(nb[b], nl[b]); };
         sort(order.begin() + o, order.end(), cmp); inplace_merge(order.begin(), order.begin() + o, order.end(), cmp);
+        for (u32 r = 0; r < order.size(); ++r) rankOf[order[r]] = r;
         sortedCount = nameCount;
       }
-      E = sortedCount;
+      memcpy(rk, rankOf, sizeof rk); E = sortedCount;
     }
     cn.assign(E + 1, 0); er.assign(E + 1, 0);
-    auto each = [&](auto f) {       // f(page, count)
+    auto each = [&](auto f) {       // f(page, count, local id -> rank table of the owning thread)
       for (unsigned t = 0; t < T; ++t) {
+        Tab& tb = ts[t].tab; u32 nn = tb.n.load(memory_order_acquire);
+        for (u32 i = 0; i < nn; ++i) rl[i] = rk[tb.gid[i]];
         for (char* b : ts[t].full[h]) f(b, BLK);
         if (ts[t].cur[h]) f(ts[t].cur[h], ts[t].fill[h]);
       }
     };
     each([&](char* b, u32 n) {
       const u16* mt = (const u16*)(b + BLK * 4);
-      for (u32 i = 0; i < n; ++i) { u32 m = mt[i]; cn[m & 0x7fff]++; er[m & 0x7fff] += m >> 15; }
+      for (u32 i = 0; i < n; ++i) { u32 m = mt[i]; u32 r = rl[m & 0x7fff]; cn[r]++; er[r] += m >> 15; }
     });
     pos.assign(E + 1, 0); u32 tot = 0;
-    for (size_t r = 0; r < E; ++r) { u32 g = order[r]; pos[g] = tot; tot += cn[g]; }
+    for (size_t r = 0; r < E; ++r) { pos[r] = tot; tot += cn[r]; }
     lat.resize(tot + 1);
     each([&](char* b, u32 n) {
       const u32* lt = (const u32*)b; const u16* mt = (const u16*)(b + BLK * 4);
-      for (u32 i = 0; i < n; ++i) lat[pos[mt[i] & 0x7fff]++] = lt[i];
+      for (u32 i = 0; i < n; ++i) lat[pos[rl[mt[i] & 0x7fff]]++] = lt[i];
     });
     consumed += tot;
     {
@@ -193,15 +196,15 @@ int main(int argc, char** argv) {
     char hs[24]; snprintf(hs, 24, "%sT%02u:00:00Z ", date[(h + 18) / 24], (unsigned)(h + 18) % 24);
     string o; o.reserve(tot * 2 + 4096); char buf[512]; u32 start = 0;
     for (size_t r = 0; r < E; ++r) {
-      u32 g = order[r]; u64 n = cn[g]; if (!n) continue;
-      u32* v = lat.data() + start; start += n;
+      u64 n = cn[r]; if (!n) continue;
+      u32* v = lat.data() + start; start += n; u32 g = order[r];
       auto ix = [&](u64 p) { return (p * n + 99) / 100 - 1; };
       u64 i50 = ix(50), i95 = ix(95), i99 = ix(99); u32 a, b, c;
       if (n <= 16) {
         for (u64 i = 1; i < n; ++i) { u32 x = v[i]; u64 j = i; while (j && v[j - 1] > x) { v[j] = v[j - 1]; --j; } v[j] = x; }
         a = v[i50]; b = v[i95]; c = v[i99];
       } else { u64 rr[3] = {i50, i95, i99}; u32 o3[3]; select3(v, n, rr, o3); a = o3[0]; b = o3[1]; c = o3[2]; }
-      u64 er_ = er[g]; char* w = buf;
+      u64 er_ = er[r]; char* w = buf;
       memcpy(w, hs, 21); w += 21; memcpy(w, nb[g], nl[g]); w += nl[g];
       *w++ = ' '; w = wu(w, n); *w++ = ' '; w = wu(w, a); *w++ = ' '; w = wu(w, b); *w++ = ' '; w = wu(w, c);
       *w++ = ' '; w = wu(w, er_); *w++ = ' '; w = wu(w, er_ * 1000000ull / n); *w++ = '\n';
