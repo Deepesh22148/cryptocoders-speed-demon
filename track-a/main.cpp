@@ -32,21 +32,22 @@ static inline u64 hash_ep(const char* p, u32 n) {
 
 // Global endpoint registry: hash -> global id, plus the names in bytewise order (extended as endpoints appear).
 static mutex rm; static unordered_map<u64, u32> byHash; static char nb[MAXE][128]; static u8 nl[MAXE];
-static u32 nameCount, sortedCount, rankOf[MAXE]; static vector<u32> order;
+static u32 nameCount, sortedCount; static vector<u32> order;
 static u32 reg(u64 h, const char* p, u32 l) {
   lock_guard<mutex> g(rm); auto it = byHash.try_emplace(h, nameCount);
   if (it.second) { memcpy(nb[nameCount], p, l); nl[nameCount++] = l; }
   return it.first->second;
 }
 
-struct Tab {   // per-thread endpoint dictionary: 8-byte slots (47-bit hash tag | 16-bit id) so the table sits in L1
-  vector<u64> s = vector<u64>(4096); u32 gid[MAXE]; atomic<u32> n{0};
+struct Slot { u64 h; u32 id; };
+struct Tab {   // per-thread endpoint dictionary: name -> global id
+  vector<Slot> s{4096};
   inline u32 find(const char* p, u32 l) {
-    u64 h = hash_ep(p, l), key = (h >> 17) | 1ull << 47;
+    u64 h = hash_ep(p, l);
     for (u64 i = (h >> 20) & 4095;; i = (i + 1) & 4095) {
-      u64 x = s[i];
-      if (x >> 16 == key) return x & 0xffff;
-      if (!x) { u32 id = n; gid[id] = reg(h, p, l); s[i] = key << 16 | id; n.store(id + 1, memory_order_release); return id; }
+      Slot& x = s[i];
+      if (x.h == h) return x.id;
+      if (!x.h) { x = {h, reg(h, p, l)}; return x.id; }
     }
   }
 };
@@ -97,8 +98,6 @@ int main(int argc, char** argv) {
   if (!fz) return 0;
   unsigned T = 12; { cpu_set_t c; if (!sched_getaffinity(0, sizeof c, &c)) T = min<int>(T, max(1, CPU_COUNT(&c))); }
 
-  char* fm_ = (char*)mmap(nullptr, fz + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);   // zero page after EOF for over-reads
-  mmap(fm_, fz, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
   const size_t NC = (fz + CH - 1) / CH, maxBlocks = fz / 40 / BLK + HRS * T + 16;   // a line is >= 40 bytes
   char* pool = (char*)mmap(nullptr, maxBlocks * BSZ, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   size_t poolNext = 0; vector<char*> freePages; mutex fm;
@@ -107,7 +106,7 @@ int main(int argc, char** argv) {
     if (freePages.empty()) return pool + poolNext++ * BSZ;
     char* p = freePages.back(); freePages.pop_back(); return p;
   };
-  byHash.reserve(8192); vector<TS> ts(T);
+  byHash.reserve(8192); vector<TS> ts(T); vector<vector<char>> bufs(T);
 
   // chunk bookkeeping: hours <= (highest hour in the finished prefix of chunks) - 2 are closed
   vector<u8> fin(NC, 0), mh(NC, 0); size_t pfx = 0; int front = 0; mutex pm;
@@ -116,10 +115,12 @@ int main(int argc, char** argv) {
 
   auto parse = [&](unsigned t, size_t k) {
     TS& st = ts[t];
-    u64 r0 = k * CH, r1 = min(fz, r0 + CH), s = k ? r0 - 1 : 0, e = min(fz, r1 + 256);
-    madvise(fm_ + (s & ~4095ull), e - (s & ~4095ull), MADV_POPULATE_READ);
-    const char* p = fm_ + s; const char* lim = fm_ + r1;
-    if (k) p = (const char*)memchr(p, '\n', 256) + 1;     // first line starting at or after r0
+    u64 r0 = k * CH, r1 = min(fz, r0 + CH), e = min(fz, r1 + 256), s = k ? r0 - 1 : 0; size_t len = e - s;
+    vector<char>& bf = bufs[t]; if (bf.size() < CH + 1 + 256 + 64) bf.resize(CH + 1 + 256 + 64);
+    for (size_t o = 0; o < len;) { ssize_t r = pread(fd, bf.data() + o, len - o, s + o); if (r <= 0) break; o += r; }
+    memset(bf.data() + len, 0, 64);
+    const char* p = bf.data(); const char* lim = p + (r1 - s);
+    if (k) p = (const char*)memchr(p, '\n', 256 + CH) + 1;     // first line starting at or after r0
     u64 ck = ~0ull, cntl = 0; u32 ch = 0, mx = 0;
     const __m128i sp = _mm_set1_epi8(' ');
     while (p < lim) {
@@ -149,7 +150,7 @@ int main(int argc, char** argv) {
 
   const char* date[4] = {"2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02"};
   auto hour = [&](size_t h) {
-    thread_local vector<u32> cn, er, pos, lat; thread_local u32 rk[MAXE]; thread_local u16 rl[MAXE];
+    thread_local vector<u32> cn, er, pos, lat;
     u32 E;
     {
       lock_guard<mutex> g(rm);
@@ -158,30 +159,27 @@ int main(int argc, char** argv) {
         for (u32 x = sortedCount; x < nameCount; ++x) order.push_back(x);
         auto cmp = [](u32 a, u32 b) { return string_view(nb[a], nl[a]) < string_view(nb[b], nl[b]); };
         sort(order.begin() + o, order.end(), cmp); inplace_merge(order.begin(), order.begin() + o, order.end(), cmp);
-        for (u32 r = 0; r < order.size(); ++r) rankOf[order[r]] = r;
         sortedCount = nameCount;
       }
-      memcpy(rk, rankOf, sizeof rk); E = sortedCount;
+      E = sortedCount;
     }
     cn.assign(E + 1, 0); er.assign(E + 1, 0);
-    auto each = [&](auto f) {       // f(page, count, local id -> rank table of the owning thread)
+    auto each = [&](auto f) {       // f(page, count)
       for (unsigned t = 0; t < T; ++t) {
-        Tab& tb = ts[t].tab; u32 nn = tb.n.load(memory_order_acquire);
-        for (u32 i = 0; i < nn; ++i) rl[i] = rk[tb.gid[i]];
         for (char* b : ts[t].full[h]) f(b, BLK);
         if (ts[t].cur[h]) f(ts[t].cur[h], ts[t].fill[h]);
       }
     };
     each([&](char* b, u32 n) {
       const u16* mt = (const u16*)(b + BLK * 4);
-      for (u32 i = 0; i < n; ++i) { u32 m = mt[i]; u32 r = rl[m & 0x7fff]; cn[r]++; er[r] += m >> 15; }
+      for (u32 i = 0; i < n; ++i) { u32 m = mt[i]; cn[m & 0x7fff]++; er[m & 0x7fff] += m >> 15; }
     });
     pos.assign(E + 1, 0); u32 tot = 0;
-    for (size_t r = 0; r < E; ++r) { pos[r] = tot; tot += cn[r]; }
+    for (size_t r = 0; r < E; ++r) { u32 g = order[r]; pos[g] = tot; tot += cn[g]; }
     lat.resize(tot + 1);
     each([&](char* b, u32 n) {
       const u32* lt = (const u32*)b; const u16* mt = (const u16*)(b + BLK * 4);
-      for (u32 i = 0; i < n; ++i) lat[pos[rl[mt[i] & 0x7fff]]++] = lt[i];
+      for (u32 i = 0; i < n; ++i) lat[pos[mt[i] & 0x7fff]++] = lt[i];
     });
     consumed += tot;
     {
@@ -195,15 +193,15 @@ int main(int argc, char** argv) {
     char hs[24]; snprintf(hs, 24, "%sT%02u:00:00Z ", date[(h + 18) / 24], (unsigned)(h + 18) % 24);
     string o; o.reserve(tot * 2 + 4096); char buf[512]; u32 start = 0;
     for (size_t r = 0; r < E; ++r) {
-      u64 n = cn[r]; if (!n) continue;
-      u32* v = lat.data() + start; start += n; u32 g = order[r];
+      u32 g = order[r]; u64 n = cn[g]; if (!n) continue;
+      u32* v = lat.data() + start; start += n;
       auto ix = [&](u64 p) { return (p * n + 99) / 100 - 1; };
       u64 i50 = ix(50), i95 = ix(95), i99 = ix(99); u32 a, b, c;
       if (n <= 16) {
         for (u64 i = 1; i < n; ++i) { u32 x = v[i]; u64 j = i; while (j && v[j - 1] > x) { v[j] = v[j - 1]; --j; } v[j] = x; }
         a = v[i50]; b = v[i95]; c = v[i99];
       } else { u64 rr[3] = {i50, i95, i99}; u32 o3[3]; select3(v, n, rr, o3); a = o3[0]; b = o3[1]; c = o3[2]; }
-      u64 er_ = er[r]; char* w = buf;
+      u64 er_ = er[g]; char* w = buf;
       memcpy(w, hs, 21); w += 21; memcpy(w, nb[g], nl[g]); w += nl[g];
       *w++ = ' '; w = wu(w, n); *w++ = ' '; w = wu(w, a); *w++ = ' '; w = wu(w, b); *w++ = ' '; w = wu(w, c);
       *w++ = ' '; w = wu(w, er_); *w++ = ' '; w = wu(w, er_ * 1000000ull / n); *w++ = '\n';
